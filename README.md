@@ -115,6 +115,45 @@ There are several directories in this repo:
 
 #### Now training can proceed as usual.
 
+### Gradient-SVD adaptive ranks
+
+This fork also supports a simple GS-LoRA workflow: first run a calibration
+forward/backward pass on the original trainable weights, then use the gradient
+singular-value spectrum to choose a different rank for each target layer.
+
+```python
+import loralib as lora
+
+# 1. Build the model before replacing target weights with LoRA.
+model = BigModel()
+loss = calibration_loss(model, calibration_batch)
+loss.backward()
+
+# 2. Convert weight gradients into a module-name -> rank dictionary.
+rank_pattern = lora.compute_adaptive_rank_pattern_from_gradients(
+    model,
+    target_modules=["q_proj", "v_proj"],
+    tau=0.90,
+    r_min=2,
+    r_max=32,
+)
+
+# 3. Use each module's rank when constructing LoRA layers.
+rank = lora.get_rank_from_pattern("layers.0.self_attn.q_proj", 8, rank_pattern)
+q_proj = lora.Linear(hidden_size, hidden_size, r=rank, lora_alpha=32)
+```
+
+For the GPT-2 NLG example, `GPT2Config` accepts
+`lora_attn_rank_pattern`, so attention ranks can be passed directly:
+
+```python
+config = GPT2Config(
+    lora_attn_dim=8,
+    lora_attn_alpha=32,
+    lora_attn_rank_pattern={0: 2, 1: 4, "h.10.attn.c_attn": 16},
+)
+```
+
 ## Additional Notes
 
 1. While we focus on a simple yet effect setup, namely adapting only the `q` and `v` projection in a Transformer, in our examples, LoRA can be apply to any subsets of pre-trained weights. We encourage you to explore different configurations, such as adapting the embedding layer by replacing `nn.Embedding` with `lora.Embedding` and/or adapting the MLP layers. It's very likely that the optimal configuration varies for different model architectures and tasks.

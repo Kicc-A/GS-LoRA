@@ -81,7 +81,7 @@ class Conv1D(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, nx, n_ctx, config, scale=False):
+    def __init__(self, nx, n_ctx, config, scale=False, layer_idx=None):
         super(Attention, self).__init__()
         n_state = nx  # in Attention: n_state=768 (nx=n_embd)
         # [switch nx => n_state from Block to Attention to keep identical to TF implem]
@@ -91,9 +91,16 @@ class Attention(nn.Module):
         self.n_head = config.n_head
         self.split_size = n_state
         self.scale = scale
+        rank_name = "h.{}.attn.c_attn".format(layer_idx) if layer_idx is not None else "attn.c_attn"
+        lora_attn_dim = lora.get_rank_from_pattern(
+            rank_name,
+            config.lora_attn_dim,
+            getattr(config, "lora_attn_rank_pattern", None),
+            layer_idx=layer_idx,
+        )
         self.c_attn = lora.MergedLinear(
             nx, n_state * 3, 
-            r=config.lora_attn_dim, 
+            r=lora_attn_dim,
             lora_alpha=config.lora_attn_alpha, 
             lora_dropout=config.lora_dropout, 
             enable_lora=[True, False, True], 
@@ -197,11 +204,11 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, n_ctx, config, scale=False):
+    def __init__(self, n_ctx, config, scale=False, layer_idx=None):
         super(Block, self).__init__()
         nx = config.n_embd
         self.ln_1 = LayerNorm(nx, eps=config.layer_norm_epsilon)
-        self.attn = Attention(nx, n_ctx, config, scale)
+        self.attn = Attention(nx, n_ctx, config, scale, layer_idx=layer_idx)
         self.ln_2 = LayerNorm(nx, eps=config.layer_norm_epsilon)
         self.mlp = MLP(4 * nx, config)
 
@@ -222,8 +229,10 @@ class GPT2Model(nn.Module):
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wpe = nn.Embedding(config.n_positions, config.n_embd)
-        block = Block(config.n_ctx, config, scale=True)
-        self.h = nn.ModuleList([copy.deepcopy(block) for _ in range(config.n_layer)])
+        self.h = nn.ModuleList([
+            Block(config.n_ctx, config, scale=True, layer_idx=layer_idx)
+            for layer_idx in range(config.n_layer)
+        ])
         self.ln_f = LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
 
         self.config = config
@@ -307,6 +316,7 @@ class GPT2Config(object):
         initializer_range=0.02,
         lora_attn_dim=0,
         lora_attn_alpha=128,
+        lora_attn_rank_pattern=None,
         lora_dropout=0.0,
         lora_r_dropout=0.0,
         fix_dropout=0.0,
@@ -321,6 +331,7 @@ class GPT2Config(object):
         self.initializer_range = initializer_range
         self.lora_attn_dim = lora_attn_dim
         self.lora_attn_alpha = lora_attn_alpha
+        self.lora_attn_rank_pattern = lora_attn_rank_pattern
         self.lora_dropout = lora_dropout
         self.lora_r_dropout = lora_r_dropout
 
