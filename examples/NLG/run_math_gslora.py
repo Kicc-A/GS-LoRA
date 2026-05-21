@@ -41,6 +41,7 @@ def parse_args():
     parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma"], default="none")
     parser.add_argument("--init_scale", type=float, default=1e-3)
     parser.add_argument("--no_compensate_scaling", action="store_true")
+    parser.add_argument("--scaling_mode", choices=["rank", "sqrt_rank", "avg_rank"], default="rank")
     parser.add_argument("--calibration_steps", type=int, default=8)
     parser.add_argument("--skip_adaptive_rank", action="store_true")
     parser.add_argument("--max_length", type=int, default=512)
@@ -442,6 +443,7 @@ def main():
         init_method=args.init_method,
         init_scale=args.init_scale,
         compensate_scaling=not args.no_compensate_scaling,
+        scaling_mode=args.scaling_mode,
     )
 
     def loss_fn(current_model, batch):

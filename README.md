@@ -142,6 +142,7 @@ config = GSLoraConfig(
     calibration_steps=16,
     init_method="svd_sqrt",
     init_scale=1e-3,
+    scaling_mode="sqrt_rank",
 )
 
 def loss_fn(model, batch):
@@ -159,6 +160,7 @@ python examples/NLG/run_math_gslora.py \
   --output_dir outputs/metamathqa_gsm8k_gslora \
   --target_modules q_proj v_proj \
   --init_method svd_sqrt \
+  --scaling_mode sqrt_rank \
   --max_train_samples 10000 \
   --max_eval_samples 200 \
   --num_train_epochs 1
@@ -174,6 +176,7 @@ deepspeed --num_gpus 4 examples/NLG/run_math_gslora.py \
   --output_dir outputs/llama31_8b_metamathqa_gsm8k_gslora \
   --target_modules q_proj k_proj v_proj o_proj \
   --init_method svd_sqrt \
+  --scaling_mode sqrt_rank \
   --max_length 512 \
   --per_device_train_batch_size 1 \
   --per_device_eval_batch_size 1 \

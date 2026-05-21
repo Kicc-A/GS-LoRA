@@ -46,14 +46,28 @@ def svd_lora_factors(
     }
 
 
+def compute_effective_scaling(rank: int, avg_rank: float, config) -> float:
+    rank = max(float(rank), 1.0)
+    avg_rank = max(float(avg_rank), 1.0)
+    if config.scaling_mode == "rank":
+        return float(config.lora_alpha) / rank
+    if config.scaling_mode == "sqrt_rank":
+        return float(config.lora_alpha) / (rank ** 0.5)
+    if config.scaling_mode == "avg_rank":
+        return float(config.lora_alpha) / ((rank * avg_rank) ** 0.5)
+    raise ValueError(f"Unknown scaling_mode: {config.scaling_mode}")
+
+
 def build_init_state(grad_cache, rank_pattern: Dict[str, int], config):
     if config.init_method == "none":
         return {}
 
     init_state = {}
+    ranks = [int(rank) for rank in rank_pattern.values()]
+    avg_rank = sum(ranks) / len(ranks) if ranks else config.base_rank
     for name, item in grad_cache.items():
         rank = int(rank_pattern[name])
-        scaling = config.lora_alpha / rank if config.compensate_scaling and rank > 0 else 1.0
+        scaling = compute_effective_scaling(rank, avg_rank, config) if config.compensate_scaling else 1.0
         factors = svd_lora_factors(
             item["grad"],
             rank,

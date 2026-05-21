@@ -55,6 +55,56 @@ def apply_svd_init(model, init_state):
     return applied
 
 
+def _get_module_rank(module, adapter_name, default_rank):
+    rank = getattr(module, "r", None)
+    if isinstance(rank, dict):
+        return int(rank.get(adapter_name, default_rank))
+    if rank is not None:
+        return int(rank)
+    return int(default_rank)
+
+
+def _compute_dynamic_scaling(rank, avg_rank, config):
+    rank = max(float(rank), 1.0)
+    avg_rank = max(float(avg_rank), 1.0)
+    if config.scaling_mode == "rank":
+        return float(config.lora_alpha) / rank
+    if config.scaling_mode == "sqrt_rank":
+        return float(config.lora_alpha) / (rank ** 0.5)
+    if config.scaling_mode == "avg_rank":
+        return float(config.lora_alpha) / ((rank * avg_rank) ** 0.5)
+    raise ValueError(f"Unknown scaling_mode: {config.scaling_mode}")
+
+
+def apply_dynamic_scaling(model, config, rank_pattern=None):
+    rank_values = [int(rank) for rank in (rank_pattern or {}).values()]
+    avg_rank = sum(rank_values) / len(rank_values) if rank_values else config.base_rank
+    applied = {}
+
+    for peft_name, module in model.named_modules():
+        if not hasattr(module, "scaling") or not hasattr(module, "lora_A"):
+            continue
+
+        original_name = next((name for name in (rank_pattern or {}) if peft_name.endswith(name)), None)
+        adapter_name = _get_active_adapter_name(module)
+        rank = int((rank_pattern or {}).get(original_name, _get_module_rank(module, adapter_name, config.base_rank)))
+        scaling = _compute_dynamic_scaling(rank, avg_rank, config)
+
+        if isinstance(module.scaling, dict):
+            module.scaling[adapter_name] = scaling
+        else:
+            module.scaling = scaling
+
+        applied[original_name or peft_name] = {
+            "peft_name": peft_name,
+            "rank": rank,
+            "scaling": scaling,
+            "scaling_mode": config.scaling_mode,
+        }
+
+    return applied
+
+
 def inject_gslora(model, config, target_names, rank_pattern=None, init_state=None):
     try:
         from peft import LoraConfig, get_peft_model
@@ -73,5 +123,6 @@ def inject_gslora(model, config, target_names, rank_pattern=None, init_state=Non
         rank_pattern=rank_pattern or {},
     )
     model = get_peft_model(model, peft_config)
+    applied_scaling = apply_dynamic_scaling(model, config, rank_pattern or {})
     applied_init = apply_svd_init(model, init_state or {})
-    return model, applied_init
+    return model, applied_init, applied_scaling

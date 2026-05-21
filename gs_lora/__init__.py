@@ -49,7 +49,7 @@ def prepare_gslora_model(model, dataloader, loss_fn, config: GSLoraConfig, devic
         rank_stats = {}
         init_state = {}
 
-    model, applied_init = inject_gslora(
+    model, applied_init, applied_scaling = inject_gslora(
         model=model,
         config=config,
         target_names=target_names,
@@ -63,6 +63,7 @@ def prepare_gslora_model(model, dataloader, loss_fn, config: GSLoraConfig, devic
         "rank_summary": summarize_ranks(rank_pattern),
         "svd_init_modules": sorted(init_state),
         "applied_init": applied_init,
+        "applied_scaling": applied_scaling,
         "params": count_trainable_params(model),
     }
     return model, report
