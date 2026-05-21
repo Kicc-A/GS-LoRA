@@ -164,6 +164,26 @@ python examples/NLG/run_math_gslora.py \
   --num_train_epochs 1
 ```
 
+For a local 4-GPU DeepSpeed run with Llama 3.1 8B:
+
+```bash
+deepspeed --num_gpus 4 examples/NLG/run_math_gslora.py \
+  --model_name_or_path /workspace/Models/Meta-Llama-3.1-8B-Instruct/Meta-Llama-3.1-8B-Instruct \
+  --train_dataset_name /workspace/datasets/MetaMathQA \
+  --eval_dataset_name /workspace/datasets/gsm8k \
+  --output_dir outputs/llama31_8b_metamathqa_gsm8k_gslora \
+  --target_modules q_proj k_proj v_proj o_proj \
+  --init_method svd_sqrt \
+  --max_length 512 \
+  --per_device_train_batch_size 1 \
+  --per_device_eval_batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --calibration_steps 4 \
+  --num_train_epochs 1 \
+  --fp16 \
+  --gradient_checkpointing
+```
+
 ```python
 import loralib as lora
 

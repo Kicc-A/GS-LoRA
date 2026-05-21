@@ -6,8 +6,9 @@ import re
 from typing import Dict, List, Optional
 
 import torch
-from datasets import load_dataset
+from datasets import DatasetDict, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
@@ -53,10 +54,15 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--deepspeed_config", type=str, default=None)
+    parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument("--trust_remote_code", action="store_true")
     return parser.parse_args()
 
 
@@ -74,6 +80,57 @@ def maybe_select(dataset, max_samples: Optional[int], seed: int):
     if max_samples is not None and max_samples < len(dataset):
         return dataset.shuffle(seed=seed).select(range(max_samples))
     return dataset
+
+
+def is_main_process() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def barrier():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def setup_distributed(args):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if "LOCAL_RANK" in os.environ:
+        args.local_rank = int(os.environ["LOCAL_RANK"])
+
+    distributed = world_size > 1
+    if distributed:
+        import deepspeed
+
+        deepspeed.init_distributed()
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    return distributed, device
+
+
+def load_split(dataset_name: str, dataset_config: Optional[str], split: str):
+    if os.path.isdir(dataset_name):
+        try:
+            dataset = load_from_disk(dataset_name)
+            if isinstance(dataset, DatasetDict):
+                return dataset[split]
+            return dataset
+        except Exception:
+            data_files = {}
+            for name in ("train", "validation", "test"):
+                for extension in ("jsonl", "json", "parquet", "csv"):
+                    path = os.path.join(dataset_name, f"{name}.{extension}")
+                    if os.path.exists(path):
+                        data_files[name] = path
+            if not data_files:
+                raise
+            extension = os.path.splitext(next(iter(data_files.values())))[1].lstrip(".")
+            loader = "json" if extension in {"json", "jsonl"} else extension
+            return load_dataset(loader, data_files=data_files, split=split)
+    if dataset_config:
+        return load_dataset(dataset_name, dataset_config, split=split)
+    return load_dataset(dataset_name, split=split)
 
 
 def tokenize_sft_example(example, tokenizer, args):
@@ -179,6 +236,95 @@ def train(model, train_loader, args, device: torch.device):
             progress.set_postfix(loss=running_loss / max(step + 1, 1), steps=completed_steps)
 
 
+def build_deepspeed_config(args, total_steps: int):
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    if args.deepspeed_config:
+        with open(args.deepspeed_config, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    return {
+        "train_micro_batch_size_per_gpu": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "gradient_clipping": args.max_grad_norm,
+        "zero_optimization": {
+            "stage": 2,
+            "allgather_partitions": True,
+            "allgather_bucket_size": 2e8,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 2e8,
+            "contiguous_gradients": True,
+        },
+        "fp16": {
+            "enabled": bool(args.fp16),
+        },
+        "bf16": {
+            "enabled": bool(args.bf16),
+        },
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": args.learning_rate,
+                "betas": [0.9, 0.999],
+                "eps": 1e-8,
+                "weight_decay": args.weight_decay,
+            },
+        },
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "total_num_steps": total_steps,
+                "warmup_min_lr": 0,
+                "warmup_max_lr": args.learning_rate,
+                "warmup_num_steps": warmup_steps,
+            },
+        },
+        "steps_per_print": 50,
+        "wall_clock_breakdown": False,
+    }
+
+
+def train_deepspeed(model, train_loader, args):
+    import deepspeed
+
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    update_steps_per_epoch = max(1, len(train_loader) // args.gradient_accumulation_steps)
+    total_steps = max(1, args.num_train_epochs * update_steps_per_epoch)
+    ds_config = build_deepspeed_config(args, total_steps)
+    model_engine, _, _, _ = deepspeed.initialize(
+        model=model,
+        model_parameters=trainable_params,
+        config=ds_config,
+    )
+
+    completed_steps = 0
+    for epoch in range(args.num_train_epochs):
+        sampler = getattr(train_loader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+
+        model_engine.train()
+        progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{args.num_train_epochs}",
+            disable=not is_main_process(),
+        )
+        running_loss = 0.0
+
+        for step, batch in enumerate(progress):
+            batch = {key: value.to(model_engine.device) for key, value in batch.items()}
+            loss = model_engine(**batch).loss
+            model_engine.backward(loss)
+            model_engine.step()
+
+            if model_engine.is_gradient_accumulation_boundary():
+                completed_steps += 1
+            running_loss += loss.detach().float().item()
+            progress.set_postfix(loss=running_loss / max(step + 1, 1), steps=completed_steps)
+
+    return model_engine
+
+
 @torch.no_grad()
 def evaluate_gsm8k(model, tokenizer, eval_dataset, args, device: torch.device) -> Dict[str, float]:
     model.eval()
@@ -230,20 +376,33 @@ def evaluate_gsm8k(model, tokenizer, eval_dataset, args, device: torch.device) -
 
 def main():
     args = parse_args()
+    distributed, device = setup_distributed(args)
     set_seed(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
+    if is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+    barrier()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name_or_path,
+        use_fast=True,
+        trust_remote_code=args.trust_remote_code,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        torch_dtype=dtype,
+        trust_remote_code=args.trust_remote_code,
+    ).to(device)
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
 
-    train_dataset = load_dataset(args.train_dataset_name, split=args.train_split)
-    eval_dataset = load_dataset(args.eval_dataset_name, args.eval_dataset_config, split=args.eval_split)
+    train_dataset = load_split(args.train_dataset_name, None, args.train_split)
+    eval_dataset = load_split(args.eval_dataset_name, args.eval_dataset_config, args.eval_split)
     train_dataset = maybe_select(train_dataset, args.max_train_samples, args.seed)
     eval_dataset = maybe_select(eval_dataset, args.max_eval_samples, args.seed)
 
@@ -252,10 +411,19 @@ def main():
         remove_columns=train_dataset.column_names,
     )
     collator = SupervisedDataCollator(tokenizer)
+    calibration_loader = DataLoader(
+        tokenized_train,
+        batch_size=args.per_device_train_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collator,
+    )
+    train_sampler = DistributedSampler(tokenized_train, shuffle=True) if distributed else None
     train_loader = DataLoader(
         tokenized_train,
         batch_size=args.per_device_train_batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collator,
     )
@@ -282,34 +450,44 @@ def main():
 
     model, gs_report = prepare_gslora_model(
         model=model,
-        dataloader=train_loader,
+        dataloader=calibration_loader,
         loss_fn=loss_fn,
         config=config,
         device=device,
     )
-    if hasattr(model, "print_trainable_parameters"):
+    if is_main_process() and hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
 
-    with open(os.path.join(args.output_dir, "gs_lora_report.json"), "w", encoding="utf-8") as f:
-        json.dump(gs_report, f, indent=2)
-    with open(os.path.join(args.output_dir, "rank_pattern.json"), "w", encoding="utf-8") as f:
-        json.dump(gs_report["rank_pattern"], f, indent=2)
-    with open(os.path.join(args.output_dir, "rank_stats.json"), "w", encoding="utf-8") as f:
-        json.dump(gs_report["rank_stats"], f, indent=2)
-    with open(os.path.join(args.output_dir, "run_config.json"), "w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2)
+    if is_main_process():
+        with open(os.path.join(args.output_dir, "gs_lora_report.json"), "w", encoding="utf-8") as f:
+            json.dump(gs_report, f, indent=2)
+        with open(os.path.join(args.output_dir, "rank_pattern.json"), "w", encoding="utf-8") as f:
+            json.dump(gs_report["rank_pattern"], f, indent=2)
+        with open(os.path.join(args.output_dir, "rank_stats.json"), "w", encoding="utf-8") as f:
+            json.dump(gs_report["rank_stats"], f, indent=2)
+        with open(os.path.join(args.output_dir, "run_config.json"), "w", encoding="utf-8") as f:
+            json.dump(vars(args), f, indent=2)
 
-    train(model, train_loader, args, device)
-    model.save_pretrained(os.path.join(args.output_dir, "last_adapter"))
-    tokenizer.save_pretrained(args.output_dir)
+    if distributed:
+        model_engine = train_deepspeed(model, train_loader, args)
+        model_to_save = model_engine.module
+    else:
+        train(model, train_loader, args, device)
+        model_to_save = model
 
-    eval_metrics = evaluate_gsm8k(model, tokenizer, eval_dataset, args, device)
-    predictions = eval_metrics.pop("predictions")
-    with open(os.path.join(args.output_dir, "gsm8k_metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(eval_metrics, f, indent=2)
-    with open(os.path.join(args.output_dir, "gsm8k_predictions.jsonl"), "w", encoding="utf-8") as f:
-        for item in predictions:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    barrier()
+    if is_main_process():
+        model_to_save.save_pretrained(os.path.join(args.output_dir, "last_adapter"))
+        tokenizer.save_pretrained(args.output_dir)
+
+        eval_metrics = evaluate_gsm8k(model_to_save, tokenizer, eval_dataset, args, device)
+        predictions = eval_metrics.pop("predictions")
+        with open(os.path.join(args.output_dir, "gsm8k_metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(eval_metrics, f, indent=2)
+        with open(os.path.join(args.output_dir, "gsm8k_predictions.jsonl"), "w", encoding="utf-8") as f:
+            for item in predictions:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    barrier()
 
 
 if __name__ == "__main__":
