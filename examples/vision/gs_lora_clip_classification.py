@@ -2,17 +2,16 @@ import argparse
 import json
 import os
 import random
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import CLIPModel, CLIPProcessor, get_scheduler
 
-import loralib as lora
+from gs_lora import GSLoraConfig, find_target_module_names, prepare_gslora_model
 
 
 def parse_args():
@@ -178,108 +177,6 @@ def clip_classification_loss(model, pixel_values, labels, text_features):
     return loss, logits
 
 
-def is_target_lora_module(name: str, module, target_prefix: str, target_modules: Iterable[str]) -> bool:
-    if not name.startswith(target_prefix):
-        return False
-    if not any(name.endswith("." + target) or name == target for target in target_modules):
-        return False
-    return hasattr(module, "weight") and getattr(module.weight, "ndim", 0) >= 2
-
-
-def enable_target_weight_grads(model, target_prefix: str, target_modules: Iterable[str]) -> List[str]:
-    for param in model.parameters():
-        param.requires_grad = False
-
-    names = []
-    for name, module in model.named_modules():
-        if is_target_lora_module(name, module, target_prefix, target_modules):
-            module.weight.requires_grad = True
-            names.append(name)
-    if not names:
-        raise ValueError("No target modules found. Check --target_prefix and --target_modules.")
-    return names
-
-
-def find_target_module_names(model, target_prefix: str, target_modules: Iterable[str]) -> List[str]:
-    names = []
-    for name, module in model.named_modules():
-        if is_target_lora_module(name, module, target_prefix, target_modules):
-            names.append(name)
-    if not names:
-        raise ValueError("No target modules found. Check --target_prefix and --target_modules.")
-    return names
-
-
-def clear_gradients(model):
-    for param in model.parameters():
-        param.grad = None
-
-
-def compute_gradient_svd_rank_pattern(
-    model,
-    dataloader,
-    text_features,
-    device: torch.device,
-    target_prefix: str,
-    target_modules: Iterable[str],
-    tau: float,
-    r_min: int,
-    r_max: int,
-    calibration_steps: int,
-) -> Tuple[Dict[str, int], Dict[str, Dict[str, float]]]:
-    enabled = enable_target_weight_grads(model, target_prefix, target_modules)
-    model.train()
-    text_features = text_features.to(device)
-    clear_gradients(model)
-
-    progress = tqdm(total=calibration_steps, desc="Calibrating gradients")
-    for step, batch in enumerate(dataloader):
-        if step >= calibration_steps:
-            break
-        pixel_values = batch["pixel_values"].to(device)
-        labels = batch["labels"].to(device)
-        loss, _ = clip_classification_loss(model, pixel_values, labels, text_features)
-        (loss / calibration_steps).backward()
-        progress.update(1)
-    progress.close()
-
-    rank_pattern, rank_stats = lora.compute_adaptive_rank_pattern_from_gradients(
-        model,
-        target_modules=lambda name, module: name in enabled,
-        tau=tau,
-        r_min=r_min,
-        r_max=r_max,
-        return_energy=True,
-    )
-    clear_gradients(model)
-    for param in model.parameters():
-        param.requires_grad = False
-    return rank_pattern, rank_stats
-
-
-def prepare_peft_model(model, args, rank_pattern: Optional[Dict[str, int]], target_module_names: List[str]):
-    for param in model.parameters():
-        param.requires_grad = False
-
-    peft_config = LoraConfig(
-        r=args.base_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        target_modules=target_module_names,
-        rank_pattern=rank_pattern or {},
-    )
-    model = get_peft_model(model, peft_config)
-
-    if args.train_logit_scale:
-        for name, param in model.named_parameters():
-            if name.endswith("logit_scale"):
-                param.requires_grad = True
-
-    model.print_trainable_parameters()
-    return model
-
-
 def evaluate(model, dataloader, text_features, device: torch.device) -> Dict[str, float]:
     model.eval()
     text_features = text_features.to(device)
@@ -377,7 +274,7 @@ def main():
 
     processor = CLIPProcessor.from_pretrained(args.model_name_or_path)
     model = CLIPModel.from_pretrained(args.model_name_or_path, torch_dtype=dtype).to(device)
-    target_module_names = find_target_module_names(model, args.target_prefix, args.target_modules)
+    target_module_names = find_target_module_names(model, args.target_modules, args.target_prefix)
 
     train_data = maybe_select(dataset, args.train_split, args.max_train_samples, args.seed)
     eval_split = args.test_split or args.validation_split
@@ -402,26 +299,55 @@ def main():
 
     text_features = build_text_features(model, processor, class_names, prompt_template, device)
 
-    rank_pattern = None
-    rank_stats = {}
-    if not args.skip_adaptive_rank:
-        rank_pattern, rank_stats = compute_gradient_svd_rank_pattern(
-            model,
-            train_loader,
-            text_features,
-            device,
-            args.target_prefix,
-            args.target_modules,
-            args.tau,
-            args.r_min,
-            args.r_max,
-            args.calibration_steps,
+    config = GSLoraConfig(
+        target_modules=args.target_modules,
+        target_prefix=args.target_prefix,
+        base_rank=args.base_rank,
+        tau=args.tau,
+        r_min=args.r_min,
+        r_max=args.r_max,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        calibration_steps=args.calibration_steps,
+        adaptive_rank=not args.skip_adaptive_rank,
+    )
+
+    def loss_fn(current_model, batch):
+        pixel_values = batch["pixel_values"].to(device)
+        labels = batch["labels"].to(device)
+        loss, _ = clip_classification_loss(
+            current_model,
+            pixel_values,
+            labels,
+            text_features.to(device),
         )
+        return loss
+
+    model, gs_report = prepare_gslora_model(
+        model=model,
+        dataloader=train_loader,
+        loss_fn=loss_fn,
+        config=config,
+        device=device,
+    )
+
+    if args.train_logit_scale:
+        for name, param in model.named_parameters():
+            if name.endswith("logit_scale"):
+                param.requires_grad = True
+
+    if hasattr(model, "print_trainable_parameters"):
+        model.print_trainable_parameters()
+
+    rank_pattern = gs_report["rank_pattern"]
+    rank_stats = gs_report["rank_stats"]
 
     with open(os.path.join(args.output_dir, "rank_pattern.json"), "w", encoding="utf-8") as f:
-        json.dump(rank_pattern or {}, f, indent=2)
+        json.dump(rank_pattern, f, indent=2)
     with open(os.path.join(args.output_dir, "rank_stats.json"), "w", encoding="utf-8") as f:
         json.dump(rank_stats, f, indent=2)
+    with open(os.path.join(args.output_dir, "gs_lora_report.json"), "w", encoding="utf-8") as f:
+        json.dump(gs_report, f, indent=2)
     with open(os.path.join(args.output_dir, "class_names.json"), "w", encoding="utf-8") as f:
         json.dump(class_names, f, indent=2)
     with open(os.path.join(args.output_dir, "run_config.json"), "w", encoding="utf-8") as f:
@@ -447,7 +373,6 @@ def main():
             indent=2,
         )
 
-    model = prepare_peft_model(model, args, rank_pattern, target_module_names)
     metrics = train(model, train_loader, eval_loader, text_features, args, device)
     final_metrics = evaluate(model, eval_loader, text_features, device)
     final_metrics = {f"final_{key}": value for key, value in final_metrics.items()}

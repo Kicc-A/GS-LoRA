@@ -121,6 +121,33 @@ This fork also supports a simple GS-LoRA workflow: first run a calibration
 forward/backward pass on the original trainable weights, then use the gradient
 singular-value spectrum to choose a different rank for each target layer.
 
+The reusable GS-LoRA workflow now lives in `gs_lora/`. Task scripts provide a
+`dataloader` and `loss_fn`, while the shared package handles target-module
+selection, calibration, rank allocation, PEFT injection, and report summaries.
+This keeps task-specific code such as CLIP preprocessing or CausalLM tokenization
+outside the algorithm layer.
+
+```python
+from gs_lora import GSLoraConfig, prepare_gslora_model
+
+config = GSLoraConfig(
+    target_modules=["q_proj", "v_proj"],
+    target_prefix=None,
+    base_rank=8,
+    tau=0.90,
+    r_min=2,
+    r_max=16,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    calibration_steps=16,
+)
+
+def loss_fn(model, batch):
+    return model(**batch).loss
+
+model, gs_report = prepare_gslora_model(model, train_loader, loss_fn, config)
+```
+
 ```python
 import loralib as lora
 

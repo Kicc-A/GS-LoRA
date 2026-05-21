@@ -71,6 +71,7 @@ Outputs include:
 
 - `rank_pattern.json`: PEFT-compatible module-name to rank mapping.
 - `rank_stats.json`: retained gradient-energy statistics.
+- `gs_lora_report.json`: target modules, rank summary, and parameter counts.
 - `run_config.json`: resolved class prompts and target module names.
 - `best_adapter/`: best PEFT adapter by validation accuracy.
 - `last_adapter/`: final PEFT adapter.
