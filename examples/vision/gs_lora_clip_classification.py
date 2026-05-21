@@ -37,6 +37,9 @@ def parse_args():
     parser.add_argument("--r_max", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma"], default="none")
+    parser.add_argument("--init_scale", type=float, default=1e-3)
+    parser.add_argument("--no_compensate_scaling", action="store_true")
     parser.add_argument("--calibration_steps", type=int, default=16)
     parser.add_argument("--num_train_epochs", type=int, default=10)
     parser.add_argument("--per_device_train_batch_size", type=int, default=32)
@@ -310,6 +313,9 @@ def main():
         lora_dropout=args.lora_dropout,
         calibration_steps=args.calibration_steps,
         adaptive_rank=not args.skip_adaptive_rank,
+        init_method=args.init_method,
+        init_scale=args.init_scale,
+        compensate_scaling=not args.no_compensate_scaling,
     )
 
     def loss_fn(current_model, batch):
@@ -367,6 +373,9 @@ def main():
                 "r_max": args.r_max,
                 "lora_alpha": args.lora_alpha,
                 "lora_dropout": args.lora_dropout,
+                "init_method": args.init_method,
+                "init_scale": args.init_scale,
+                "compensate_scaling": not args.no_compensate_scaling,
                 "skip_adaptive_rank": args.skip_adaptive_rank,
             },
             f,

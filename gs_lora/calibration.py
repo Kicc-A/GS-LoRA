@@ -12,6 +12,7 @@ except ImportError:
         return _NoOpProgress()
 
 from .rank_allocator import allocate_ranks
+from .init import build_init_state
 from .targets import find_target_module_names
 
 
@@ -55,7 +56,6 @@ def collect_gradients(model, dataloader, loss_fn, config):
             continue
         grad_cache[name] = {
             "grad": grad.detach().float().cpu(),
-            "weight": module.weight.detach().float().cpu(),
         }
 
     clear_gradients(model)
@@ -70,9 +70,15 @@ def collect_gradients(model, dataloader, loss_fn, config):
 
 def calibrate_gslora(model, dataloader, loss_fn, config):
     target_names, grad_cache = collect_gradients(model, dataloader, loss_fn, config)
-    rank_pattern, rank_stats = allocate_ranks(grad_cache, config)
+    if config.adaptive_rank:
+        rank_pattern, rank_stats = allocate_ranks(grad_cache, config)
+    else:
+        rank_pattern = {name: int(config.base_rank) for name in target_names if name in grad_cache}
+        rank_stats = {}
+    init_state = build_init_state(grad_cache, rank_pattern, config)
     return {
         "target_names": target_names,
         "rank_pattern": rank_pattern,
         "rank_stats": rank_stats,
+        "init_state": init_state,
     }

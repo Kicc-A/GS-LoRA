@@ -140,12 +140,28 @@ config = GSLoraConfig(
     lora_alpha=16,
     lora_dropout=0.05,
     calibration_steps=16,
+    init_method="svd_sqrt",
+    init_scale=1e-3,
 )
 
 def loss_fn(model, batch):
     return model(**batch).loss
 
 model, gs_report = prepare_gslora_model(model, train_loader, loss_fn, config)
+```
+
+For math reasoning SFT, `examples/NLG/run_math_gslora.py` trains on
+MetaMathQA and evaluates exact-match accuracy on GSM8K:
+
+```bash
+python examples/NLG/run_math_gslora.py \
+  --model_name_or_path /path/to/causal-lm \
+  --output_dir outputs/metamathqa_gsm8k_gslora \
+  --target_modules q_proj v_proj \
+  --init_method svd_sqrt \
+  --max_train_samples 10000 \
+  --max_eval_samples 200 \
+  --num_train_epochs 1
 ```
 
 ```python

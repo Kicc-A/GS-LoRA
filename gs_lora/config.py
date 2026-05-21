@@ -15,3 +15,6 @@ class GSLoraConfig:
     calibration_steps: int = 16
     adaptive_rank: bool = True
     bias: str = "none"
+    init_method: str = "none"
+    init_scale: float = 1e-3
+    compensate_scaling: bool = True
