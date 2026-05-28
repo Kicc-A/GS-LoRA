@@ -11,6 +11,8 @@ except ImportError:
 
         return _NoOpProgress()
 
+import time
+
 from .rank_allocator import allocate_ranks
 from .init import build_init_state
 from .targets import find_target_module_names
@@ -55,7 +57,7 @@ def collect_gradients(model, dataloader, loss_fn, config):
         if grad is None:
             continue
         grad_cache[name] = {
-            "grad": grad.detach().float().cpu(),
+            "grad": grad.detach().float(),
         }
 
     clear_gradients(model)
@@ -70,12 +72,19 @@ def collect_gradients(model, dataloader, loss_fn, config):
 
 def calibrate_gslora(model, dataloader, loss_fn, config):
     target_names, grad_cache = collect_gradients(model, dataloader, loss_fn, config)
+    print(f"Collected gradients for {len(grad_cache)} LoRA target matrices", flush=True)
     if config.adaptive_rank:
+        start = time.time()
+        print("Allocating adaptive ranks...", flush=True)
         rank_pattern, rank_stats = allocate_ranks(grad_cache, config)
+        print(f"Rank allocation finished in {time.time() - start:.1f}s", flush=True)
     else:
         rank_pattern = {name: int(config.base_rank) for name in target_names if name in grad_cache}
         rank_stats = {}
+    start = time.time()
+    print(f"Building SVD init state with method={config.init_method}...", flush=True)
     init_state = build_init_state(grad_cache, rank_pattern, config)
+    print(f"SVD init state built in {time.time() - start:.1f}s", flush=True)
     return {
         "target_names": target_names,
         "rank_pattern": rank_pattern,

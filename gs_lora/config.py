@@ -19,3 +19,5 @@ class GSLoraConfig:
     init_scale: float = 1e-3
     compensate_scaling: bool = True
     scaling_mode: str = "rank"
+    rank_budget_mode: str = "independent"
+    param_budget: Optional[int] = None

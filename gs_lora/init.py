@@ -28,6 +28,19 @@ def svd_lora_factors(
     singular_values = singular_values[:rank]
     vh = vh[:rank, :]
 
+    if method == "svd_a_zero_b":
+        lora_a = vh[:rank, :] * init_scale
+        lora_b = torch.zeros(
+            grad_matrix.shape[0],
+            rank,
+            dtype=lora_a.dtype,
+            device=lora_a.device,
+        )
+        return {
+            "lora_A": lora_a.cpu(),
+            "lora_B": lora_b.cpu(),
+        }
+
     if method == "svd_sqrt":
         root = torch.sqrt(singular_values.clamp_min(0.0))
         lora_b = -u * root.unsqueeze(0)

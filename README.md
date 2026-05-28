@@ -151,6 +151,10 @@ def loss_fn(model, batch):
 model, gs_report = prepare_gslora_model(model, train_loader, loss_fn, config)
 ```
 
+Use `--init_method svd_a_zero_b` to only initialize LoRA-A with the right
+singular vectors of the task gradient and keep LoRA-B zero, so the initial LoRA
+update is exactly zero and the base model behavior is preserved.
+
 For math reasoning SFT, `examples/NLG/run_math_gslora.py` trains on
 MetaMathQA and evaluates exact-match accuracy on GSM8K:
 

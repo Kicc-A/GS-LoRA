@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument("--r_max", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma"], default="none")
+    parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b"], default="none")
     parser.add_argument("--init_scale", type=float, default=1e-3)
     parser.add_argument("--no_compensate_scaling", action="store_true")
     parser.add_argument("--scaling_mode", choices=["rank", "sqrt_rank", "avg_rank"], default="rank")

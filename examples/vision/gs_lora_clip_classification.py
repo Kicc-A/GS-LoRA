@@ -2,12 +2,13 @@ import argparse
 import json
 import os
 import random
+import sys
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm.auto import tqdm
 from transformers import CLIPModel, CLIPProcessor, get_scheduler
 
@@ -37,14 +38,17 @@ def parse_args():
     parser.add_argument("--r_max", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma"], default="none")
+    parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b"], default="none")
     parser.add_argument("--init_scale", type=float, default=1e-3)
     parser.add_argument("--no_compensate_scaling", action="store_true")
     parser.add_argument("--scaling_mode", choices=["rank", "sqrt_rank", "avg_rank"], default="rank")
+    parser.add_argument("--rank_budget_mode", choices=["independent", "param"], default="independent")
+    parser.add_argument("--param_budget", type=int, default=None)
     parser.add_argument("--calibration_steps", type=int, default=16)
     parser.add_argument("--num_train_epochs", type=int, default=10)
     parser.add_argument("--per_device_train_batch_size", type=int, default=32)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=64)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
@@ -56,7 +60,62 @@ def parse_args():
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--train_logit_scale", action="store_true")
     parser.add_argument("--skip_adaptive_rank", action="store_true")
+    parser.add_argument("--svhn_single_digit", action="store_true")
     return parser.parse_args()
+
+
+class TeeLogger:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+class SvhnSingleDigitDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.indices = [idx for idx, label in enumerate(dataset["label"]) if len(label["digit"]) == 1]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        item = self.dataset[int(self.indices[int(idx)])]
+        digit = int(item["label"]["digit"][0])
+        return {
+            "image": item["image"].convert("RGB"),
+            "label": 0 if digit == 10 else digit,
+        }
+
+
+class VisionTransformDataset(Dataset):
+    def __init__(self, dataset, processor):
+        self.dataset = dataset
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[int(idx)]
+        pixel_values = self.processor(images=[item["image"]], return_tensors="pt")["pixel_values"][0]
+        return {"pixel_values": pixel_values, "labels": item["label"]}
+
+
+def setup_file_logging(output_dir: str):
+    log_path = os.path.join(output_dir, "train.log")
+    log_file = open(log_path, "a", buffering=1, encoding="utf-8")
+    sys.stdout = TeeLogger(sys.__stdout__, log_file)
+    sys.stderr = TeeLogger(sys.__stderr__, log_file)
+    print(f"Logging to {log_path}", flush=True)
+    return log_file
 
 
 def set_seed(seed: int):
@@ -147,6 +206,16 @@ def get_clip_backbone(model):
     return model
 
 
+def to_float_tensor(output):
+    if torch.is_tensor(output):
+        return output.float()
+    if hasattr(output, "pooler_output") and output.pooler_output is not None:
+        return output.pooler_output.float()
+    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        return output.last_hidden_state[:, 0, :].float()
+    raise TypeError(f"Cannot convert {type(output)!r} to a tensor.")
+
+
 @torch.no_grad()
 def build_text_features(
     model,
@@ -164,7 +233,7 @@ def build_text_features(
     for start in range(0, len(prompts), batch_size):
         batch_prompts = prompts[start : start + batch_size]
         inputs = processor(text=batch_prompts, padding=True, return_tensors="pt").to(device)
-        text_features = clip_model.get_text_features(**inputs)
+        text_features = to_float_tensor(clip_model.get_text_features(**inputs))
         text_features = F.normalize(text_features, dim=-1)
         features.append(text_features.cpu())
 
@@ -173,7 +242,7 @@ def build_text_features(
 
 def clip_classification_loss(model, pixel_values, labels, text_features):
     clip_model = get_clip_backbone(model)
-    image_features = clip_model.get_image_features(pixel_values=pixel_values)
+    image_features = to_float_tensor(clip_model.get_image_features(pixel_values=pixel_values))
     image_features = F.normalize(image_features, dim=-1)
     logits = image_features @ text_features.t()
     logits = logits * clip_model.logit_scale.exp()
@@ -207,7 +276,11 @@ def evaluate(model, dataloader, text_features, device: torch.device) -> Dict[str
 def train(model, train_loader, eval_loader, text_features, args, device: torch.device):
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
-    total_steps = args.num_train_epochs * len(train_loader)
+    update_steps_per_epoch = max(
+        1,
+        (len(train_loader) + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps,
+    )
+    total_steps = args.num_train_epochs * update_steps_per_epoch
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_scheduler(
         "cosine",
@@ -227,26 +300,37 @@ def train(model, train_loader, eval_loader, text_features, args, device: torch.d
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.num_train_epochs}")
         running_loss = 0.0
         seen = 0
+        correct = 0
+        optimizer.zero_grad(set_to_none=True)
 
-        for batch in progress:
+        for step, batch in enumerate(progress):
             pixel_values = batch["pixel_values"].to(device)
             labels = batch["labels"].to(device)
-            optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=use_autocast, dtype=autocast_dtype):
-                loss, _ = clip_classification_loss(model, pixel_values, labels, text_features)
+                loss, logits = clip_classification_loss(model, pixel_values, labels, text_features)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            scaler.scale(loss / args.gradient_accumulation_steps).backward()
+            should_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_loader)
+            if should_step:
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
             running_loss += loss.item() * labels.numel()
+            correct += (logits.argmax(dim=-1) == labels).sum().item()
             seen += labels.numel()
-            progress.set_postfix(loss=running_loss / max(seen, 1))
+            progress.set_postfix(
+                loss=running_loss / max(seen, 1),
+                acc=correct / max(seen, 1),
+                lr=scheduler.get_last_lr()[0],
+            )
 
         eval_metrics = evaluate(model, eval_loader, text_features, device)
         eval_metrics["epoch"] = epoch + 1
+        eval_metrics["train_loss"] = running_loss / max(seen, 1)
+        eval_metrics["train_acc"] = correct / max(seen, 1)
         print(json.dumps(eval_metrics, indent=2))
 
         if eval_metrics["accuracy"] > best_accuracy:
@@ -264,27 +348,42 @@ def maybe_select(dataset, split: str, max_samples: Optional[int], seed: int):
     return data
 
 
+def maybe_subset(dataset, max_samples: Optional[int], seed: int):
+    if max_samples is None or max_samples >= len(dataset):
+        return dataset
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator)[:max_samples].tolist()
+    return Subset(dataset, indices)
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
+    log_file = setup_file_logging(args.output_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
 
     dataset = load_classification_dataset(args)
-    class_names = get_class_names(dataset, args.train_split, args.label_column)
+    class_names = [str(i) for i in range(10)] if args.svhn_single_digit else get_class_names(dataset, args.train_split, args.label_column)
     prompt_template = infer_prompt_template(args.dataset_name or args.dataset_dir, args.prompt_template)
 
     processor = CLIPProcessor.from_pretrained(args.model_name_or_path)
     model = CLIPModel.from_pretrained(args.model_name_or_path, torch_dtype=dtype).to(device)
     target_module_names = find_target_module_names(model, args.target_modules, args.target_prefix)
 
-    train_data = maybe_select(dataset, args.train_split, args.max_train_samples, args.seed)
     eval_split = args.test_split or args.validation_split
-    eval_data = maybe_select(dataset, eval_split, args.max_eval_samples, args.seed)
-    train_data = preprocess_dataset(train_data, processor, args.image_column, args.label_column)
-    eval_data = preprocess_dataset(eval_data, processor, args.image_column, args.label_column)
+    if args.svhn_single_digit:
+        train_data = SvhnSingleDigitDataset(dataset[args.train_split])
+        eval_data = SvhnSingleDigitDataset(dataset[eval_split])
+        train_data = VisionTransformDataset(maybe_subset(train_data, args.max_train_samples, args.seed), processor)
+        eval_data = VisionTransformDataset(maybe_subset(eval_data, args.max_eval_samples, args.seed), processor)
+    else:
+        train_data = maybe_select(dataset, args.train_split, args.max_train_samples, args.seed)
+        eval_data = maybe_select(dataset, eval_split, args.max_eval_samples, args.seed)
+        train_data = preprocess_dataset(train_data, processor, args.image_column, args.label_column)
+        eval_data = preprocess_dataset(eval_data, processor, args.image_column, args.label_column)
 
     train_loader = DataLoader(
         train_data,
@@ -318,6 +417,8 @@ def main():
         init_scale=args.init_scale,
         compensate_scaling=not args.no_compensate_scaling,
         scaling_mode=args.scaling_mode,
+        rank_budget_mode=args.rank_budget_mode,
+        param_budget=args.param_budget,
     )
 
     def loss_fn(current_model, batch):
@@ -375,11 +476,15 @@ def main():
                 "r_max": args.r_max,
                 "lora_alpha": args.lora_alpha,
                 "lora_dropout": args.lora_dropout,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
                 "init_method": args.init_method,
                 "init_scale": args.init_scale,
                 "compensate_scaling": not args.no_compensate_scaling,
                 "scaling_mode": args.scaling_mode,
+                "rank_budget_mode": args.rank_budget_mode,
+                "param_budget": args.param_budget,
                 "skip_adaptive_rank": args.skip_adaptive_rank,
+                "svhn_single_digit": args.svhn_single_digit,
             },
             f,
             indent=2,
@@ -394,6 +499,7 @@ def main():
         json.dump(metrics, f, indent=2)
     processor.save_pretrained(args.output_dir)
     model.save_pretrained(os.path.join(args.output_dir, "last_adapter"))
+    log_file.close()
 
 
 if __name__ == "__main__":
