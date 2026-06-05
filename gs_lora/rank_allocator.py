@@ -3,6 +3,14 @@ from typing import Dict, Tuple
 import torch
 
 
+def _svd_compute_device(source: torch.Tensor) -> torch.device:
+    if source.is_cuda:
+        return source.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return source.device
+
+
 def adaptive_rank_from_gradient(
     grad_matrix: torch.Tensor,
     tau: float = 0.90,
@@ -22,6 +30,7 @@ def adaptive_rank_from_gradient(
     grad = grad_matrix.detach().float()
     if grad.ndim > 2:
         grad = grad.reshape(grad.shape[0], -1)
+    grad = grad.to(_svd_compute_device(grad), non_blocking=True)
 
     max_rank = min(grad.shape)
     r_min = min(r_min, max_rank)
@@ -50,6 +59,7 @@ def allocate_independent_ranks(
     for name, item in grad_cache.items():
         grad = item["grad"]
         flat_grad = grad.detach().float().reshape(grad.shape[0], -1)
+        flat_grad = flat_grad.to(_svd_compute_device(flat_grad), non_blocking=True)
         singular_values = torch.linalg.svdvals(flat_grad)
         energy = singular_values.pow(2)
         total_energy = energy.sum().item()
@@ -89,6 +99,7 @@ def allocate_global_param_budget_ranks(
     for name, item in grad_cache.items():
         grad = item["grad"]
         flat_grad = grad.detach().float().reshape(grad.shape[0], -1)
+        flat_grad = flat_grad.to(_svd_compute_device(flat_grad), non_blocking=True)
         singular_values = torch.linalg.svdvals(flat_grad)
         energy = singular_values.pow(2)
         total_energy = energy.sum().item()

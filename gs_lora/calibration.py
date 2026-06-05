@@ -57,7 +57,7 @@ def collect_gradients(model, dataloader, loss_fn, config):
         if grad is None:
             continue
         grad_cache[name] = {
-            "grad": grad.detach().float(),
+            "grad": grad.detach().float().cpu(),
         }
 
     clear_gradients(model)
@@ -82,9 +82,9 @@ def calibrate_gslora(model, dataloader, loss_fn, config):
         rank_pattern = {name: int(config.base_rank) for name in target_names if name in grad_cache}
         rank_stats = {}
     start = time.time()
-    print(f"Building SVD init state with method={config.init_method}...", flush=True)
+    print(f"Building init state with method={config.init_method}...", flush=True)
     init_state = build_init_state(grad_cache, rank_pattern, config)
-    print(f"SVD init state built in {time.time() - start:.1f}s", flush=True)
+    print(f"Init state built in {time.time() - start:.1f}s", flush=True)
     return {
         "target_names": target_names,
         "rank_pattern": rank_pattern,

@@ -1,13 +1,16 @@
 import argparse
+import csv
 import json
 import os
 import random
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm.auto import tqdm
 from transformers import CLIPModel, CLIPProcessor, get_scheduler
@@ -23,6 +26,9 @@ def parse_args():
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--dataset_config", type=str, default=None)
     parser.add_argument("--dataset_dir", type=str, default=None)
+    parser.add_argument("--zhou_root", type=str, default=None)
+    parser.add_argument("--zhou_split_file", type=str, default=None)
+    parser.add_argument("--gtsrb_root", type=str, default=None)
     parser.add_argument("--image_column", type=str, default="image")
     parser.add_argument("--label_column", type=str, default="label")
     parser.add_argument("--train_split", type=str, default="train")
@@ -38,8 +44,15 @@ def parse_args():
     parser.add_argument("--r_max", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b"], default="none")
+    parser.add_argument(
+        "--init_method",
+        choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "gora_pinv"],
+        default="none",
+    )
     parser.add_argument("--init_scale", type=float, default=1e-3)
+    parser.add_argument("--gora_stable_gamma", type=float, default=5e-2)
+    parser.add_argument("--gora_scale_by_lr", action="store_true")
+    parser.add_argument("--gora_lr", type=float, default=5e-2)
     parser.add_argument("--no_compensate_scaling", action="store_true")
     parser.add_argument("--scaling_mode", choices=["rank", "sqrt_rank", "avg_rank"], default="rank")
     parser.add_argument("--rank_budget_mode", choices=["independent", "param"], default="independent")
@@ -75,7 +88,8 @@ class TeeLogger:
 
     def flush(self):
         for stream in self.streams:
-            stream.flush()
+            if not getattr(stream, "closed", False):
+                stream.flush()
 
 
 class SvhnSingleDigitDataset(Dataset):
@@ -95,6 +109,103 @@ class SvhnSingleDigitDataset(Dataset):
         }
 
 
+class ZhouSplitDataset(Dataset):
+    def __init__(self, root: str, split_file: str, split: str):
+        self.root = Path(root)
+        with open(split_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.samples = data[split]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        rel_path, label, _ = self.samples[int(idx)]
+        image = Image.open(self.root / rel_path).convert("RGB")
+        return {"image": image, "label": int(label)}
+
+
+def get_zhou_class_names(split_file: str) -> List[str]:
+    with open(split_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    names = {}
+    for samples in data.values():
+        for _, label, class_name in samples:
+            names[int(label)] = str(class_name)
+    return [names[idx] for idx in sorted(names)]
+
+
+class GTSRBDataset(Dataset):
+    def __init__(self, root: str, split: str):
+        self.root = Path(root)
+        self.samples = []
+        if split == "train":
+            with open(self.root / "Train.csv", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    self.samples.append((row["Path"], int(row["ClassId"])))
+        elif split == "test":
+            with open(self.root / "Test.csv", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    self.samples.append((row["Path"], int(row["ClassId"])))
+        else:
+            raise ValueError(f"GTSRB supports train/test splits, got {split!r}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        rel_path, label = self.samples[int(idx)]
+        image = Image.open(self.root / rel_path).convert("RGB")
+        return {"image": image, "label": label}
+
+
+GTSRB_CLASS_NAMES = [
+    "speed limit 20 km/h",
+    "speed limit 30 km/h",
+    "speed limit 50 km/h",
+    "speed limit 60 km/h",
+    "speed limit 70 km/h",
+    "speed limit 80 km/h",
+    "end of speed limit 80 km/h",
+    "speed limit 100 km/h",
+    "speed limit 120 km/h",
+    "no passing",
+    "no passing for vehicles over 3.5 metric tons",
+    "right-of-way at the next intersection",
+    "priority road",
+    "yield",
+    "stop",
+    "no vehicles",
+    "vehicles over 3.5 metric tons prohibited",
+    "no entry",
+    "general caution",
+    "dangerous curve to the left",
+    "dangerous curve to the right",
+    "double curve",
+    "bumpy road",
+    "slippery road",
+    "road narrows on the right",
+    "road work",
+    "traffic signals",
+    "pedestrians",
+    "children crossing",
+    "bicycles crossing",
+    "beware of ice or snow",
+    "wild animals crossing",
+    "end of all speed and passing limits",
+    "turn right ahead",
+    "turn left ahead",
+    "ahead only",
+    "go straight or right",
+    "go straight or left",
+    "keep right",
+    "keep left",
+    "roundabout mandatory",
+    "end of no passing",
+    "end of no passing by vehicles over 3.5 metric tons",
+]
+
+
 class VisionTransformDataset(Dataset):
     def __init__(self, dataset, processor):
         self.dataset = dataset
@@ -112,10 +223,12 @@ class VisionTransformDataset(Dataset):
 def setup_file_logging(output_dir: str):
     log_path = os.path.join(output_dir, "train.log")
     log_file = open(log_path, "a", buffering=1, encoding="utf-8")
-    sys.stdout = TeeLogger(sys.__stdout__, log_file)
-    sys.stderr = TeeLogger(sys.__stderr__, log_file)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeLogger(original_stdout, log_file)
+    sys.stderr = TeeLogger(original_stderr, log_file)
     print(f"Logging to {log_path}", flush=True)
-    return log_file
+    return log_file, original_stdout, original_stderr
 
 
 def set_seed(seed: int):
@@ -125,6 +238,9 @@ def set_seed(seed: int):
 
 
 def load_classification_dataset(args):
+    if args.zhou_root or args.zhou_split_file or args.gtsrb_root:
+        return None
+
     if args.dataset_dir:
         dataset = load_dataset("imagefolder", data_dir=args.dataset_dir)
     elif args.dataset_name:
@@ -162,6 +278,12 @@ def infer_prompt_template(dataset_name: Optional[str], prompt_template: Optional
         return "a photo of a {} texture."
     if "food" in name:
         return "a photo of {}."
+    if "cars" in name or "stanfordcars" in name:
+        return "a photo of the {}, a type of car."
+    if "eurosat" in name:
+        return "a centered satellite photo of {}."
+    if "gtsrb" in name:
+        return "a photo of a traffic sign: {}."
     return "a photo of a {}."
 
 
@@ -360,21 +482,42 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
-    log_file = setup_file_logging(args.output_dir)
+    log_file, original_stdout, original_stderr = setup_file_logging(args.output_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
 
     dataset = load_classification_dataset(args)
-    class_names = [str(i) for i in range(10)] if args.svhn_single_digit else get_class_names(dataset, args.train_split, args.label_column)
-    prompt_template = infer_prompt_template(args.dataset_name or args.dataset_dir, args.prompt_template)
+    if args.zhou_root or args.zhou_split_file:
+        if not args.zhou_root or not args.zhou_split_file:
+            raise ValueError("Pass both --zhou_root and --zhou_split_file.")
+        class_names = get_zhou_class_names(args.zhou_split_file)
+    elif args.gtsrb_root:
+        class_names = GTSRB_CLASS_NAMES
+    elif args.svhn_single_digit:
+        class_names = [str(i) for i in range(10)]
+    else:
+        class_names = get_class_names(dataset, args.train_split, args.label_column)
+
+    dataset_hint = args.dataset_name or args.dataset_dir or args.zhou_root or args.gtsrb_root
+    prompt_template = infer_prompt_template(dataset_hint, args.prompt_template)
 
     processor = CLIPProcessor.from_pretrained(args.model_name_or_path)
     model = CLIPModel.from_pretrained(args.model_name_or_path, torch_dtype=dtype).to(device)
     target_module_names = find_target_module_names(model, args.target_modules, args.target_prefix)
 
     eval_split = args.test_split or args.validation_split
-    if args.svhn_single_digit:
+    if args.zhou_root:
+        train_data = ZhouSplitDataset(args.zhou_root, args.zhou_split_file, args.train_split)
+        eval_data = ZhouSplitDataset(args.zhou_root, args.zhou_split_file, eval_split)
+        train_data = VisionTransformDataset(maybe_subset(train_data, args.max_train_samples, args.seed), processor)
+        eval_data = VisionTransformDataset(maybe_subset(eval_data, args.max_eval_samples, args.seed), processor)
+    elif args.gtsrb_root:
+        train_data = GTSRBDataset(args.gtsrb_root, args.train_split)
+        eval_data = GTSRBDataset(args.gtsrb_root, eval_split)
+        train_data = VisionTransformDataset(maybe_subset(train_data, args.max_train_samples, args.seed), processor)
+        eval_data = VisionTransformDataset(maybe_subset(eval_data, args.max_eval_samples, args.seed), processor)
+    elif args.svhn_single_digit:
         train_data = SvhnSingleDigitDataset(dataset[args.train_split])
         eval_data = SvhnSingleDigitDataset(dataset[eval_split])
         train_data = VisionTransformDataset(maybe_subset(train_data, args.max_train_samples, args.seed), processor)
@@ -415,6 +558,9 @@ def main():
         adaptive_rank=not args.skip_adaptive_rank,
         init_method=args.init_method,
         init_scale=args.init_scale,
+        gora_stable_gamma=args.gora_stable_gamma,
+        gora_scale_by_lr=args.gora_scale_by_lr,
+        gora_lr=args.gora_lr,
         compensate_scaling=not args.no_compensate_scaling,
         scaling_mode=args.scaling_mode,
         rank_budget_mode=args.rank_budget_mode,
@@ -466,6 +612,12 @@ def main():
                 "dataset_name": args.dataset_name,
                 "dataset_config": args.dataset_config,
                 "dataset_dir": args.dataset_dir,
+                "zhou_root": args.zhou_root,
+                "zhou_split_file": args.zhou_split_file,
+                "gtsrb_root": args.gtsrb_root,
+                "train_split": args.train_split,
+                "validation_split": args.validation_split,
+                "test_split": args.test_split,
                 "prompt_template": prompt_template,
                 "target_module_names": target_module_names,
                 "target_modules": args.target_modules,
@@ -477,8 +629,19 @@ def main():
                 "lora_alpha": args.lora_alpha,
                 "lora_dropout": args.lora_dropout,
                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "num_train_epochs": args.num_train_epochs,
+                "per_device_train_batch_size": args.per_device_train_batch_size,
+                "per_device_eval_batch_size": args.per_device_eval_batch_size,
+                "learning_rate": args.learning_rate,
+                "weight_decay": args.weight_decay,
+                "warmup_ratio": args.warmup_ratio,
+                "calibration_steps": args.calibration_steps,
+                "seed": args.seed,
                 "init_method": args.init_method,
                 "init_scale": args.init_scale,
+                "gora_stable_gamma": args.gora_stable_gamma,
+                "gora_scale_by_lr": args.gora_scale_by_lr,
+                "gora_lr": args.gora_lr,
                 "compensate_scaling": not args.no_compensate_scaling,
                 "scaling_mode": args.scaling_mode,
                 "rank_budget_mode": args.rank_budget_mode,
@@ -499,6 +662,8 @@ def main():
         json.dump(metrics, f, indent=2)
     processor.save_pretrained(args.output_dir)
     model.save_pretrained(os.path.join(args.output_dir, "last_adapter"))
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
     log_file.close()
 
 

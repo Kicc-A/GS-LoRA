@@ -64,6 +64,12 @@ def parse_args():
     parser.add_argument("--deepspeed_config", type=str, default=None)
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="gslora")
+    parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--wandb_mode", choices=["online", "offline", "disabled"], default="online")
+    parser.add_argument("--wandb_dir", type=str, default=None)
+    parser.add_argument("--wandb_log_interval", type=int, default=10)
     return parser.parse_args()
 
 
@@ -85,6 +91,44 @@ def maybe_select(dataset, max_samples: Optional[int], seed: int):
 
 def is_main_process() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
+
+
+def init_wandb(args):
+    if not args.wandb or not is_main_process():
+        args._wandb_run = None
+        return
+    try:
+        import wandb
+    except ImportError:
+        print("wandb is not installed; continuing without wandb logging.")
+        args._wandb_run = None
+        return
+
+    if args.wandb_dir:
+        os.makedirs(args.wandb_dir, exist_ok=True)
+    try:
+        args._wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name,
+            mode=args.wandb_mode,
+            dir=args.wandb_dir,
+            config=vars(args),
+        )
+    except Exception as exc:
+        print(f"wandb init failed; continuing without wandb logging: {exc}")
+        args._wandb_run = None
+
+
+def log_wandb(args, metrics: Dict[str, float], step: Optional[int] = None):
+    run = getattr(args, "_wandb_run", None)
+    if run is not None and is_main_process():
+        run.log(metrics, step=step)
+
+
+def finish_wandb(args):
+    run = getattr(args, "_wandb_run", None)
+    if run is not None and is_main_process():
+        run.finish()
 
 
 def barrier():
@@ -235,6 +279,19 @@ def train(model, train_loader, args, device: torch.device):
 
             running_loss += loss.item()
             progress.set_postfix(loss=running_loss / max(step + 1, 1), steps=completed_steps)
+            if args.wandb_log_interval > 0 and (step + 1) % args.wandb_log_interval == 0:
+                log_wandb(
+                    args,
+                    {
+                        "train/loss": float(loss.detach().float().item()),
+                        "train/running_loss": running_loss / max(step + 1, 1),
+                        "train/lr": float(scheduler.get_last_lr()[0]),
+                        "train/epoch": epoch,
+                        "train/micro_step": step + 1,
+                        "train/optimizer_step": completed_steps,
+                    },
+                    step=completed_steps,
+                )
 
 
 def build_deepspeed_config(args, total_steps: int):
@@ -269,6 +326,7 @@ def build_deepspeed_config(args, total_steps: int):
                 "betas": [0.9, 0.999],
                 "eps": 1e-8,
                 "weight_decay": args.weight_decay,
+                "torch_adam": True,
             },
         },
         "scheduler": {
@@ -322,6 +380,23 @@ def train_deepspeed(model, train_loader, args):
                 completed_steps += 1
             running_loss += loss.detach().float().item()
             progress.set_postfix(loss=running_loss / max(step + 1, 1), steps=completed_steps)
+            if is_main_process() and args.wandb_log_interval > 0 and (step + 1) % args.wandb_log_interval == 0:
+                try:
+                    lr = float(model_engine.get_lr()[0])
+                except Exception:
+                    lr = args.learning_rate
+                log_wandb(
+                    args,
+                    {
+                        "train/loss": float(loss.detach().float().item()),
+                        "train/running_loss": running_loss / max(step + 1, 1),
+                        "train/lr": lr,
+                        "train/epoch": epoch,
+                        "train/micro_step": step + 1,
+                        "train/optimizer_step": completed_steps,
+                    },
+                    step=completed_steps,
+                )
 
     return model_engine
 
@@ -382,6 +457,7 @@ def main():
     if is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
     barrier()
+    init_wandb(args)
 
     dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
 
@@ -468,7 +544,7 @@ def main():
         with open(os.path.join(args.output_dir, "rank_stats.json"), "w", encoding="utf-8") as f:
             json.dump(gs_report["rank_stats"], f, indent=2)
         with open(os.path.join(args.output_dir, "run_config.json"), "w", encoding="utf-8") as f:
-            json.dump(vars(args), f, indent=2)
+            json.dump({key: value for key, value in vars(args).items() if key != "_wandb_run"}, f, indent=2)
 
     if distributed:
         model_engine = train_deepspeed(model, train_loader, args)
@@ -484,11 +560,13 @@ def main():
 
         eval_metrics = evaluate_gsm8k(model_to_save, tokenizer, eval_dataset, args, device)
         predictions = eval_metrics.pop("predictions")
+        log_wandb(args, {f"eval/{key}": value for key, value in eval_metrics.items()})
         with open(os.path.join(args.output_dir, "gsm8k_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(eval_metrics, f, indent=2)
         with open(os.path.join(args.output_dir, "gsm8k_predictions.jsonl"), "w", encoding="utf-8") as f:
             for item in predictions:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        finish_wandb(args)
     barrier()
 
 

@@ -3,6 +3,14 @@ from typing import Dict
 import torch
 
 
+def _svd_compute_device(source: torch.Tensor) -> torch.device:
+    if source.is_cuda:
+        return source.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return source.device
+
+
 def svd_lora_factors(
     grad,
     rank: int,
@@ -18,6 +26,7 @@ def svd_lora_factors(
     grad_matrix = grad.detach().float()
     if grad_matrix.ndim > 2:
         grad_matrix = grad_matrix.reshape(grad_matrix.shape[0], -1)
+    grad_matrix = grad_matrix.to(_svd_compute_device(grad_matrix), non_blocking=True)
 
     u, singular_values, vh = torch.linalg.svd(grad_matrix, full_matrices=False)
     rank = min(rank, singular_values.numel())
@@ -76,6 +85,11 @@ def build_init_state(grad_cache, rank_pattern: Dict[str, int], config):
         return {}
 
     init_state = {}
+    if config.init_method == "gora_pinv":
+        for name, item in grad_cache.items():
+            init_state[name] = {"grad": item["grad"].detach().float().cpu()}
+        return init_state
+
     ranks = [int(rank) for rank in rank_pattern.values()]
     avg_rank = sum(ranks) / len(ranks) if ranks else config.base_rank
     for name, item in grad_cache.items():

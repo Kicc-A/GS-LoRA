@@ -116,6 +116,35 @@ def svd_lora_factors(grad, weight, rank, init_scale, effective_scaling, init_met
     }
 
 
+def svd_target_delta(grad, weight, rank, init_scale, effective_scaling):
+    factors = svd_lora_factors(grad, weight, rank, init_scale, effective_scaling, "svd_sqrt")
+    if factors is None:
+        return None
+    return factors["lora_B"] @ factors["lora_A"]
+
+
+def compensated_svd_factors(grad, weight, rank, init_scale, effective_scaling):
+    target_delta = svd_target_delta(grad, weight, rank, init_scale, effective_scaling)
+    if target_delta is None:
+        return None
+    lora_b = torch.empty(target_delta.shape[0], rank, dtype=target_delta.dtype)
+    nn.init.kaiming_uniform_(lora_b, a=np.sqrt(5))
+    lora_a = torch.linalg.pinv(lora_b.float()) @ target_delta.float()
+    return {
+        "lora_A": lora_a.to(target_delta.dtype).cpu(),
+        "lora_B": lora_b.cpu(),
+        "target_delta": target_delta.cpu(),
+    }
+
+
+def compensated_svd_direction_factors(grad, weight, rank, init_scale, effective_scaling):
+    factors = svd_lora_factors(grad, weight, rank, init_scale, effective_scaling, "svd_sqrt")
+    if factors is None:
+        return None
+    factors["target_delta"] = factors["lora_B"] @ factors["lora_A"]
+    return factors
+
+
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -434,6 +463,11 @@ def collect_grad_cache(model):
     return grad_cache
 
 
+def _compensate_weight_(weight, lora_a, lora_b, scaling):
+    delta = (lora_b @ lora_a).to(device=weight.device, dtype=weight.dtype) * scaling
+    weight.sub_(delta)
+
+
 def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_method):
     modules = {}
     for idx, block in enumerate(model.visual.transformer.resblocks):
@@ -445,7 +479,12 @@ def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_meth
     for name, item in grad_cache.items():
         rank = int(rank_pattern[name])
         scaling = alpha / rank if rank > 0 else 1.0
-        factors = svd_lora_factors(item["grad"], item["weight"], rank, init_scale, scaling, init_method)
+        if init_method == "svd_compensated":
+            factors = compensated_svd_factors(item["grad"], item["weight"], rank, init_scale, scaling)
+        elif init_method == "svd_compensated_svd":
+            factors = compensated_svd_direction_factors(item["grad"], item["weight"], rank, init_scale, scaling)
+        else:
+            factors = svd_lora_factors(item["grad"], item["weight"], rank, init_scale, scaling, init_method)
         if factors is None:
             continue
         module = modules.get(name)
@@ -453,18 +492,26 @@ def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_meth
             if isinstance(module, LoRALinear):
                 module.lora_A.copy_(factors["lora_A"].to(module.lora_A.device, module.lora_A.dtype))
                 module.lora_B.copy_(factors["lora_B"].to(module.lora_B.device, module.lora_B.dtype))
+                if init_method.startswith("svd_compensated"):
+                    _compensate_weight_(module.weight, module.lora_A, module.lora_B, scaling)
                 continue
             module_name, which = name.rsplit(".", 1)
             module = modules[module_name]
             if which == "q":
                 module.q_A.copy_(factors["lora_A"].to(module.q_A.device, module.q_A.dtype))
                 module.q_B.copy_(factors["lora_B"].to(module.q_B.device, module.q_B.dtype))
+                if init_method.startswith("svd_compensated"):
+                    _compensate_weight_(module.in_proj_weight[: module.embed_dim], module.q_A, module.q_B, scaling)
             elif which == "k":
                 module.k_A.copy_(factors["lora_A"].to(module.k_A.device, module.k_A.dtype))
                 module.k_B.copy_(factors["lora_B"].to(module.k_B.device, module.k_B.dtype))
+                if init_method.startswith("svd_compensated"):
+                    _compensate_weight_(module.in_proj_weight[module.embed_dim : 2 * module.embed_dim], module.k_A, module.k_B, scaling)
             elif which == "v":
                 module.v_A.copy_(factors["lora_A"].to(module.v_A.device, module.v_A.dtype))
                 module.v_B.copy_(factors["lora_B"].to(module.v_B.device, module.v_B.dtype))
+                if init_method.startswith("svd_compensated"):
+                    _compensate_weight_(module.in_proj_weight[2 * module.embed_dim :], module.v_A, module.v_B, scaling)
     print(f"SVD init finished in {time.time() - start:.1f}s", flush=True)
 
 
@@ -539,7 +586,7 @@ def main():
     parser.add_argument("--rank-budget-mode", choices=["independent", "param"], default="param")
     parser.add_argument("--param-budget", type=int, default=None)
     parser.add_argument("--calibration-steps", type=int, default=16)
-    parser.add_argument("--init-method", choices=["svd_sqrt", "svd_a_zero_b"], default="svd_sqrt")
+    parser.add_argument("--init-method", choices=["svd_sqrt", "svd_a_zero_b", "svd_compensated", "svd_compensated_svd"], default="svd_sqrt")
     parser.add_argument("--svd-scale", "--init-scale", "--init_scale", dest="svd_scale", type=float, default=0.01)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
