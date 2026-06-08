@@ -44,10 +44,10 @@ deepspeed --include localhost:2 --master_port 16672 \
   --num_train_epochs 1 \
   --per_device_train_batch_size 1 \
   --per_device_eval_batch_size 1 \
-  --gradient_accumulation_steps 32 \
+  --gradient_accumulation_steps 64 \
   --learning_rate 5e-5 \
   --weight_decay 5e-4 \
-  --warmup_ratio 0.3 \
+  --warmup_ratio 0.03 \
   --max_grad_norm 1.0 \
   --bf16 \
   --gradient_checkpointing \

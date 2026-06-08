@@ -38,6 +38,8 @@ def parse_args():
     parser.add_argument("--r_max", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--use_lora_plus", action="store_true", help="Use LoRA+ style higher LR for LoRA B weights")
+    parser.add_argument("--lora_plus_scaler", type=float, default=16.0, help="LR multiplier for LoRA B weights when LoRA+ is enabled")
     parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b"], default="none")
     parser.add_argument("--init_scale", type=float, default=1e-3)
     parser.add_argument("--no_compensate_scaling", action="store_true")
@@ -239,8 +241,38 @@ def extract_gsm8k_answer(text: str) -> str:
     return matches[-1].replace(",", "").strip()
 
 
+def build_trainable_param_groups(model, args):
+    if not getattr(args, "use_lora_plus", False):
+        return [param for param in model.parameters() if param.requires_grad]
+
+    default_params = []
+    lora_b_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "lora_B" in name or "weight_b" in name:
+            lora_b_params.append(param)
+        else:
+            default_params.append(param)
+
+    param_groups = []
+    if default_params:
+        param_groups.append({"params": default_params, "lr": args.learning_rate})
+    if lora_b_params:
+        param_groups.append({"params": lora_b_params, "lr": args.learning_rate * args.lora_plus_scaler})
+        if is_main_process():
+            print(
+                f"[LoRA+] enabled: {len(lora_b_params)} LoRA-B tensors use "
+                f"lr={args.learning_rate * args.lora_plus_scaler:.6g} "
+                f"(base_lr={args.learning_rate:.6g}, scaler={args.lora_plus_scaler})"
+            )
+    elif is_main_process():
+        print("[LoRA+][Warning] enabled but no LoRA-B parameters were matched.")
+    return param_groups
+
+
 def train(model, train_loader, args, device: torch.device):
-    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    trainable_params = build_trainable_param_groups(model, args)
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
     update_steps_per_epoch = max(1, len(train_loader) // args.gradient_accumulation_steps)
     total_steps = args.num_train_epochs * update_steps_per_epoch
@@ -346,7 +378,7 @@ def build_deepspeed_config(args, total_steps: int):
 def train_deepspeed(model, train_loader, args):
     import deepspeed
 
-    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    trainable_params = build_trainable_param_groups(model, args)
     update_steps_per_epoch = max(1, len(train_loader) // args.gradient_accumulation_steps)
     total_steps = max(1, args.num_train_epochs * update_steps_per_epoch)
     ds_config = build_deepspeed_config(args, total_steps)
