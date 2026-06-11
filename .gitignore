@@ -133,3 +133,89 @@ post/
 *.nupkg
 /Packages
 
+
+# experiment outputs
+outputs/
+logs/
+wandb/
+
+# checkpoints / model files
+checkpoint-*/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# tokenizer / trainer generated files
+trainer_state.json
+training_args.bin
+optimizer.pt
+scheduler.pt
+rng_state.pth
+
+# python cache
+__pycache__/
+*.pyc
+
+# datasets / cache
+datasets/
+DATA/
+.cache/
+
+# runtime datasets
+runtime_datasets/
+datasets/
+DATA/
+
+# experiment outputs
+outputs/
+logs/
+wandb/
+
+# checkpoints / model files
+checkpoint-*/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# trainer generated files
+trainer_state.json
+training_args.bin
+optimizer.pt
+scheduler.pt
+rng_state.pth
+
+# python cache
+__pycache__/
+*.pyc
+.cache/
+
+# runtime datasets
+runtime_datasets/
+datasets/
+DATA/
+
+# experiment outputs
+outputs/
+logs/
+wandb/
+
+# checkpoints / model files
+checkpoint-*/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# trainer generated files
+trainer_state.json
+training_args.bin
+optimizer.pt
+scheduler.pt
+rng_state.pth
+
+# python cache
+__pycache__/
+*.pyc
+.cache/

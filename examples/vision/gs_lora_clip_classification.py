@@ -36,14 +36,14 @@ def parse_args():
     parser.add_argument("--test_split", type=str, default=None)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--prompt_template", type=str, default=None)
-    parser.add_argument("--target_modules", nargs="+", default=["q_proj", "v_proj", "out_proj"])
+    parser.add_argument("--target_modules", nargs="+", default=["q_proj", "v_proj"])
     parser.add_argument("--target_prefix", type=str, default="vision_model")
     parser.add_argument("--base_rank", type=int, default=8)
     parser.add_argument("--tau", type=float, default=0.90)
     parser.add_argument("--r_min", type=int, default=2)
     parser.add_argument("--r_max", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=16)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument(
         "--init_method",
         choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "gora_pinv"],
@@ -59,10 +59,11 @@ def parse_args():
     parser.add_argument("--param_budget", type=int, default=None)
     parser.add_argument("--calibration_steps", type=int, default=16)
     parser.add_argument("--num_train_epochs", type=int, default=10)
-    parser.add_argument("--per_device_train_batch_size", type=int, default=32)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=64)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=64)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--loraplus_lr_ratio", type=float, default=16.0)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--max_train_samples", type=int, default=None)
@@ -273,17 +274,6 @@ def get_class_names(dataset, split: str, label_column: str) -> List[str]:
 def infer_prompt_template(dataset_name: Optional[str], prompt_template: Optional[str]) -> str:
     if prompt_template:
         return prompt_template
-    name = (dataset_name or "").lower()
-    if "dtd" in name:
-        return "a photo of a {} texture."
-    if "food" in name:
-        return "a photo of {}."
-    if "cars" in name or "stanfordcars" in name:
-        return "a photo of the {}, a type of car."
-    if "eurosat" in name:
-        return "a centered satellite photo of {}."
-    if "gtsrb" in name:
-        return "a photo of a traffic sign: {}."
     return "a photo of a {}."
 
 
@@ -395,9 +385,33 @@ def evaluate(model, dataloader, text_features, device: torch.device) -> Dict[str
     }
 
 
+def build_loraplus_param_groups(model, base_lr: float, ratio: float, weight_decay: float):
+    lora_a_params = []
+    lora_b_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "lora_A" in name:
+            lora_a_params.append(param)
+        elif "lora_B" in name:
+            lora_b_params.append(param)
+        else:
+            other_params.append(param)
+
+    groups = []
+    if lora_a_params:
+        groups.append({"params": lora_a_params, "lr": base_lr, "weight_decay": weight_decay})
+    if lora_b_params:
+        groups.append({"params": lora_b_params, "lr": base_lr * ratio, "weight_decay": weight_decay})
+    if other_params:
+        groups.append({"params": other_params, "lr": base_lr, "weight_decay": weight_decay})
+    return groups
+
+
 def train(model, train_loader, eval_loader, text_features, args, device: torch.device):
-    trainable_params = [param for param in model.parameters() if param.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    param_groups = build_loraplus_param_groups(model, args.learning_rate, args.loraplus_lr_ratio, args.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate, weight_decay=args.weight_decay)
     update_steps_per_epoch = max(
         1,
         (len(train_loader) + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps,
@@ -633,6 +647,7 @@ def main():
                 "per_device_train_batch_size": args.per_device_train_batch_size,
                 "per_device_eval_batch_size": args.per_device_eval_batch_size,
                 "learning_rate": args.learning_rate,
+                "loraplus_lr_ratio": args.loraplus_lr_ratio,
                 "weight_decay": args.weight_decay,
                 "warmup_ratio": args.warmup_ratio,
                 "calibration_steps": args.calibration_steps,

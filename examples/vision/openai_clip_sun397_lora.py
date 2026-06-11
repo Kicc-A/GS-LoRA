@@ -554,6 +554,32 @@ def save_lora_state(model, path, args, class_names, rank_pattern, rank_stats, me
     )
 
 
+def build_loraplus_param_groups(model, base_lr: float, ratio: float, weight_decay: float):
+    lora_a_tokens = ("lora_A", "q_A", "k_A", "v_A")
+    lora_b_tokens = ("lora_B", "q_B", "k_B", "v_B")
+    lora_a_params = []
+    lora_b_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(token in name for token in lora_a_tokens):
+            lora_a_params.append(param)
+        elif any(token in name for token in lora_b_tokens):
+            lora_b_params.append(param)
+        else:
+            other_params.append(param)
+
+    groups = []
+    if lora_a_params:
+        groups.append({"params": lora_a_params, "lr": base_lr, "weight_decay": weight_decay})
+    if lora_b_params:
+        groups.append({"params": lora_b_params, "lr": base_lr * ratio, "weight_decay": weight_decay})
+    if other_params:
+        groups.append({"params": other_params, "lr": base_lr, "weight_decay": weight_decay})
+    return groups
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", choices=["gs_lora", "lora_official"], required=True)
@@ -575,6 +601,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--loraplus-lr-ratio", type=float, default=16.0)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--base-rank", type=int, default=8)
@@ -594,12 +621,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     if args.prompt_template is None:
-        if args.dataset == "svhn":
-            args.prompt_template = "a photo of the digit {}."
-        elif args.dataset == "dtd":
-            args.prompt_template = "a photo of a {} texture."
-        else:
-            args.prompt_template = "a photo of a {}."
+        args.prompt_template = "a photo of a {}."
 
     seed_everything(args.seed)
     output_dir = Path(args.output_dir)
@@ -747,7 +769,11 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     print(f"trainable params: {trainable:,} || all params: {total:,} || trainable%: {100 * trainable / total:.4f}")
 
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        build_loraplus_param_groups(model, args.lr, args.loraplus_lr_ratio, args.weight_decay),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     total_steps = max(1, args.epochs * len(train_loader))
     warmup_steps = int(total_steps * args.warmup_ratio)
 
