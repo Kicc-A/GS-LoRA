@@ -219,3 +219,31 @@ rng_state.pth
 __pycache__/
 *.pyc
 .cache/
+
+# large runtime datasets
+runtime_datasets/
+*.jsonl
+
+# experiment outputs
+outputs/
+logs/
+wandb/
+
+# checkpoints / model files
+checkpoint-*/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# trainer generated files
+trainer_state.json
+training_args.bin
+optimizer.pt
+scheduler.pt
+rng_state.pth
+
+# python cache
+__pycache__/
+*.pyc
+.cache/
