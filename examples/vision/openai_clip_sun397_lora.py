@@ -83,6 +83,44 @@ def allocate_param_budget(singular_values, rank_costs, r_min, r_max, param_budge
     return ranks
 
 
+def allocate_independent_capped(singular_values, rank_costs, tau, r_min, r_max, param_budget, min_rank_overrides=None):
+    ranks = {}
+    target_ranks = {}
+    candidates = []
+    for name, values in singular_values.items():
+        max_rank = min(int(values.numel()), r_max)
+        override_min = r_min
+        if min_rank_overrides is not None:
+            override_min = min_rank_overrides.get(name, r_min)
+        min_rank = min(int(override_min), max_rank)
+        energy = values.pow(2)
+        total = energy.sum()
+        if max_rank == 0:
+            target_rank = 0
+        elif total <= 1e-12:
+            target_rank = min_rank
+        else:
+            cumulative = torch.cumsum(energy, dim=0) / total
+            target_rank = int(torch.searchsorted(cumulative, values.new_tensor(tau)).item() + 1)
+            target_rank = max(min_rank, min(target_rank, max_rank))
+        ranks[name] = min_rank
+        target_ranks[name] = target_rank
+        for rank_index in range(min_rank, target_rank):
+            score = energy[rank_index].item() / max(rank_costs[name], 1)
+            candidates.append((score, name))
+
+    def total_cost():
+        return sum(ranks[name] * rank_costs[name] for name in ranks)
+
+    budget = max(total_cost(), param_budget)
+    for _, name in sorted(candidates, reverse=True):
+        cost = rank_costs[name]
+        if ranks[name] >= target_ranks[name] or total_cost() + cost > budget:
+            continue
+        ranks[name] += 1
+    return ranks, target_ranks
+
+
 def svd_lora_factors(grad, weight, rank, init_scale, effective_scaling, init_method="svd_sqrt", eps=1e-12):
     grad_matrix = grad.detach().float().reshape(grad.shape[0], -1)
     u, singular_values, vh = torch.linalg.svd(grad_matrix, full_matrices=False)
@@ -246,8 +284,35 @@ def build_dtd_split(root, split_file, train_split, test_split):
     return class_names, train_samples, test_samples
 
 
+def build_zhou_image_split(root, split_file, train_split, test_split):
+    with Path(split_file).open() as f:
+        split = json.load(f)
+    class_by_label = {}
+
+    def read_split(name):
+        samples = []
+        for rel_path, label, class_name in split[name]:
+            label = int(label)
+            class_by_label[label] = class_name
+            path = Path(root) / rel_path
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            samples.append((str(path), label))
+        return samples
+
+    train_samples = read_split(train_split)
+    test_samples = read_split(test_split)
+    class_names = [class_by_label[idx] for idx in sorted(class_by_label)]
+    return class_names, train_samples, test_samples
+
+
 def format_class_name(name):
-    return name.replace("_", " ").replace("-", " ")
+    # Strip SUN397 subdirectory prefix (e.g., 'a/abbey' -> 'abbey',
+    # 'a/apartment_building/outdoor' -> 'apartment_building/outdoor')
+    parts = name.split("/")
+    if len(parts) > 1:
+        name = "/".join(parts[1:])
+    return name.replace("_", " ").replace("-", " ").replace("/", " ")
 
 
 class LoRALinear(nn.Module):
@@ -583,7 +648,7 @@ def build_loraplus_param_groups(model, base_lr: float, ratio: float, weight_deca
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", choices=["gs_lora", "lora_official"], required=True)
-    parser.add_argument("--dataset", choices=["sun397", "svhn", "dtd"], default="sun397")
+    parser.add_argument("--dataset", choices=["sun397", "svhn", "dtd", "eurosat", "stanfordcars"], default="sun397")
     parser.add_argument("--data-root", default="/workspace/KeepLoRA/MTIL/data/Sun397")
     parser.add_argument("--partition-dir", default="/workspace/KeepLoRA/MTIL/data/Sun397/Partitions")
     parser.add_argument("--train-list", default="Training_01.txt")
@@ -594,6 +659,14 @@ def main():
     parser.add_argument("--dtd-split-file", default="/workspace/KeepLoRA/MTIL/data/DTD/split_zhou_DescribableTextures.json")
     parser.add_argument("--dtd-train-split", default="train")
     parser.add_argument("--dtd-test-split", default="test")
+    parser.add_argument("--eurosat-root", default="/workspace/KeepLoRA/MTIL/data/EuroSAT/eurosat/2750")
+    parser.add_argument("--eurosat-split-file", default="/workspace/KeepLoRA/MTIL/data/EuroSAT/split_zhou_EuroSAT.json")
+    parser.add_argument("--eurosat-train-split", default="train")
+    parser.add_argument("--eurosat-test-split", default="test")
+    parser.add_argument("--stanfordcars-root", default="/workspace/KeepLoRA/MTIL/data/StanfordCars")
+    parser.add_argument("--stanfordcars-split-file", default="/workspace/KeepLoRA/MTIL/data/StanfordCars/split_zhou_StanfordCars.json")
+    parser.add_argument("--stanfordcars-train-split", default="train")
+    parser.add_argument("--stanfordcars-test-split", default="test")
     parser.add_argument("--clip-cache-root", default="/root/.cache/clip")
     parser.add_argument("--prompt-template", default=None)
     parser.add_argument("--output-dir", required=True)
@@ -610,7 +683,8 @@ def main():
     parser.add_argument("--tau", type=float, default=0.90)
     parser.add_argument("--r-min", type=int, default=2)
     parser.add_argument("--r-max", type=int, default=16)
-    parser.add_argument("--rank-budget-mode", choices=["independent", "param"], default="param")
+    parser.add_argument("--rank-budget-mode", choices=["independent", "param", "independent_capped"], default="param")
+    parser.add_argument("--qk-min-rank", type=int, default=None)
     parser.add_argument("--param-budget", type=int, default=None)
     parser.add_argument("--calibration-steps", type=int, default=16)
     parser.add_argument("--init-method", choices=["svd_sqrt", "svd_a_zero_b", "svd_compensated", "svd_compensated_svd"], default="svd_sqrt")
@@ -659,7 +733,7 @@ def main():
             if args.max_eval_samples is not None:
                 test_dataset.indices = test_dataset.indices[: args.max_eval_samples]
             print(f"SVHN single digit: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
-        else:
+        elif args.dataset == "dtd":
             class_names, train_samples, test_samples = build_dtd_split(
                 args.dtd_root,
                 args.dtd_split_file,
@@ -673,6 +747,34 @@ def main():
             train_dataset = ImagePathDataset(train_samples, preprocess)
             test_dataset = ImagePathDataset(test_samples, preprocess)
             print(f"DTD: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
+        elif args.dataset == "eurosat":
+            class_names, train_samples, test_samples = build_zhou_image_split(
+                args.eurosat_root,
+                args.eurosat_split_file,
+                args.eurosat_train_split,
+                args.eurosat_test_split,
+            )
+            if args.max_train_samples is not None:
+                train_samples = train_samples[: args.max_train_samples]
+            if args.max_eval_samples is not None:
+                test_samples = test_samples[: args.max_eval_samples]
+            train_dataset = ImagePathDataset(train_samples, preprocess)
+            test_dataset = ImagePathDataset(test_samples, preprocess)
+            print(f"EuroSAT: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
+        else:
+            class_names, train_samples, test_samples = build_zhou_image_split(
+                args.stanfordcars_root,
+                args.stanfordcars_split_file,
+                args.stanfordcars_train_split,
+                args.stanfordcars_test_split,
+            )
+            if args.max_train_samples is not None:
+                train_samples = train_samples[: args.max_train_samples]
+            if args.max_eval_samples is not None:
+                test_samples = test_samples[: args.max_eval_samples]
+            train_dataset = ImagePathDataset(train_samples, preprocess)
+            test_dataset = ImagePathDataset(test_samples, preprocess)
+            print(f"StanfordCars: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
     calib_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
@@ -706,7 +808,7 @@ def main():
         print(f"Collected gradients for {len(grad_cache)} LoRA matrices", flush=True)
         print("Allocating adaptive ranks...", flush=True)
         start = time.time()
-        if args.rank_budget_mode == "param":
+        if args.rank_budget_mode in ("param", "independent_capped"):
             rank_costs = {
                 name: int(item["grad"].reshape(item["grad"].shape[0], -1).shape[0] + item["grad"].reshape(item["grad"].shape[0], -1).shape[1])
                 for name, item in grad_cache.items()
@@ -721,7 +823,26 @@ def main():
                     min(args.base_rank, int(values.numel()), args.r_max) * rank_costs[name]
                     for name, values in singular_values.items()
                 )
-            rank_pattern = allocate_param_budget(singular_values, rank_costs, args.r_min, args.r_max, param_budget)
+            if args.rank_budget_mode == "independent_capped":
+                min_rank_overrides = None
+                if args.qk_min_rank is not None:
+                    min_rank_overrides = {
+                        name: args.qk_min_rank
+                        for name in singular_values
+                        if name.endswith(".attn.q") or name.endswith(".attn.k")
+                    }
+                rank_pattern, target_ranks = allocate_independent_capped(
+                    singular_values,
+                    rank_costs,
+                    args.tau,
+                    args.r_min,
+                    args.r_max,
+                    param_budget,
+                    min_rank_overrides,
+                )
+            else:
+                rank_pattern = allocate_param_budget(singular_values, rank_costs, args.r_min, args.r_max, param_budget)
+                target_ranks = {name: rank_pattern[name] for name in singular_values}
             rank_stats = {}
             for name, values in singular_values.items():
                 rank = rank_pattern[name]
@@ -734,6 +855,9 @@ def main():
                     "total_energy": total,
                     "rank_cost": rank_costs[name],
                     "param_count": rank * rank_costs[name],
+                    "target_rank": float(target_ranks.get(name, rank)),
+                    "budget_target": int(param_budget),
+                    "min_rank": float(min_rank_overrides.get(name, args.r_min)) if args.rank_budget_mode == "independent_capped" and min_rank_overrides is not None else float(args.r_min),
                 }
         else:
             rank_pattern, rank_stats = allocate_ranks(grad_cache, RankConfig(args.tau, args.r_min, args.r_max, args.base_rank))

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
 from PIL import Image
@@ -75,6 +76,8 @@ def parse_args():
     parser.add_argument("--train_logit_scale", action="store_true")
     parser.add_argument("--skip_adaptive_rank", action="store_true")
     parser.add_argument("--svhn_single_digit", action="store_true")
+    parser.add_argument("--use_cls_head", action="store_true",
+                        help="Use [CLS] token + classifier head (GoRA paper protocol)")
     return parser.parse_args()
 
 
@@ -338,7 +341,13 @@ def build_text_features(
     batch_size: int = 128,
 ) -> torch.Tensor:
     model.eval()
-    prompts = [prompt_template.format(name.replace("_", " ")) for name in class_names]
+    prompts = []
+    for name in class_names:
+        # Strip SUN397 subdirectory prefix (e.g., 'a/abbey' -> 'abbey')
+        parts = name.split("/")
+        clean = "/".join(parts[1:]) if len(parts) > 1 else name
+        clean = clean.replace("_", " ").replace("-", " ").replace("/", " ")
+        prompts.append(prompt_template.format(clean))
     features = []
     clip_model = get_clip_backbone(model)
 
@@ -362,9 +371,24 @@ def clip_classification_loss(model, pixel_values, labels, text_features):
     return loss, logits
 
 
-def evaluate(model, dataloader, text_features, device: torch.device) -> Dict[str, float]:
+def cls_classification_loss(model, pixel_values, labels):
+    """[CLS] token + classifier head — matches GoRA paper protocol.
+    Manually computes image_features (vision → pooler → projection → L2 normalize)
+    because PeftModel wrapping can break get_image_features()."""
+    clip_model = get_clip_backbone(model)
+    vision_outputs = clip_model.vision_model(pixel_values=pixel_values)
+    pooled = vision_outputs.pooler_output
+    image_features = clip_model.visual_projection(pooled)
+    image_features = F.normalize(image_features.float(), dim=-1)
+    logits = model.classifier(image_features)
+    loss = F.cross_entropy(logits, labels)
+    return loss, logits
+
+
+def evaluate(model, dataloader, text_features, device: torch.device, use_cls_head: bool = False) -> Dict[str, float]:
     model.eval()
-    text_features = text_features.to(device)
+    if not use_cls_head:
+        text_features = text_features.to(device)
     correct = 0
     total = 0
     total_loss = 0.0
@@ -373,7 +397,10 @@ def evaluate(model, dataloader, text_features, device: torch.device) -> Dict[str
         for batch in tqdm(dataloader, desc="Evaluating"):
             pixel_values = batch["pixel_values"].to(device)
             labels = batch["labels"].to(device)
-            loss, logits = clip_classification_loss(model, pixel_values, labels, text_features)
+            if use_cls_head:
+                loss, logits = cls_classification_loss(model, pixel_values, labels)
+            else:
+                loss, logits = clip_classification_loss(model, pixel_values, labels, text_features)
             preds = logits.argmax(dim=-1)
             correct += (preds == labels).sum().item()
             total += labels.numel()
@@ -409,7 +436,8 @@ def build_loraplus_param_groups(model, base_lr: float, ratio: float, weight_deca
     return groups
 
 
-def train(model, train_loader, eval_loader, text_features, args, device: torch.device):
+def train(model, train_loader, eval_loader, text_features, args, device: torch.device,
+          use_cls_head: bool = False):
     param_groups = build_loraplus_param_groups(model, args.learning_rate, args.loraplus_lr_ratio, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate, weight_decay=args.weight_decay)
     update_steps_per_epoch = max(
@@ -427,7 +455,8 @@ def train(model, train_loader, eval_loader, text_features, args, device: torch.d
     scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
     autocast_dtype = torch.bfloat16 if args.bf16 else torch.float16
     use_autocast = args.fp16 or args.bf16
-    text_features = text_features.to(device)
+    if not use_cls_head:
+        text_features = text_features.to(device)
 
     best_accuracy = -1.0
     metrics = {}
@@ -444,7 +473,10 @@ def train(model, train_loader, eval_loader, text_features, args, device: torch.d
             labels = batch["labels"].to(device)
 
             with torch.cuda.amp.autocast(enabled=use_autocast, dtype=autocast_dtype):
-                loss, logits = clip_classification_loss(model, pixel_values, labels, text_features)
+                if use_cls_head:
+                    loss, logits = cls_classification_loss(model, pixel_values, labels)
+                else:
+                    loss, logits = clip_classification_loss(model, pixel_values, labels, text_features)
 
             scaler.scale(loss / args.gradient_accumulation_steps).backward()
             should_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_loader)
@@ -463,7 +495,7 @@ def train(model, train_loader, eval_loader, text_features, args, device: torch.d
                 lr=scheduler.get_last_lr()[0],
             )
 
-        eval_metrics = evaluate(model, eval_loader, text_features, device)
+        eval_metrics = evaluate(model, eval_loader, text_features, device, use_cls_head)
         eval_metrics["epoch"] = epoch + 1
         eval_metrics["train_loss"] = running_loss / max(seen, 1)
         eval_metrics["train_acc"] = correct / max(seen, 1)
@@ -557,6 +589,8 @@ def main():
         collate_fn=collate_fn,
     )
 
+    # --- Add classifier head for [CLS] token classification (GoRA paper protocol) ---
+    use_cls_head = args.use_cls_head
     text_features = build_text_features(model, processor, class_names, prompt_template, device)
 
     config = GSLoraConfig(
@@ -582,14 +616,11 @@ def main():
     )
 
     def loss_fn(current_model, batch):
+        # Always use text-prompt loss for calibration (meaningful gradients)
         pixel_values = batch["pixel_values"].to(device)
         labels = batch["labels"].to(device)
         loss, _ = clip_classification_loss(
-            current_model,
-            pixel_values,
-            labels,
-            text_features.to(device),
-        )
+            current_model, pixel_values, labels, text_features.to(device))
         return loss
 
     model, gs_report = prepare_gslora_model(
@@ -599,6 +630,17 @@ def main():
         config=config,
         device=device,
     )
+
+    # --- Add classifier head AFTER prepare_gslora_model (so it's on the right model) ---
+    if use_cls_head:
+        # Use projected dim (512 for ViT-B/16), same as CLIP embedding space
+        proj_dim = model.config.projection_dim
+        # Initialize classifier weight with text features (CLIP zero-shot weights)
+        # so 1-epoch training matches GoRA paper protocol
+        model.classifier = nn.Linear(proj_dim, len(class_names), bias=False).to(device)
+        with torch.no_grad():
+            text_feats = build_text_features(model, processor, class_names, prompt_template, device)
+            model.classifier.weight.copy_(text_feats.to(device))
 
     if args.train_logit_scale:
         for name, param in model.named_parameters():
@@ -668,8 +710,9 @@ def main():
             indent=2,
         )
 
-    metrics = train(model, train_loader, eval_loader, text_features, args, device)
-    final_metrics = evaluate(model, eval_loader, text_features, device)
+    metrics = train(model, train_loader, eval_loader, text_features, args, device,
+                    use_cls_head=use_cls_head)
+    final_metrics = evaluate(model, eval_loader, text_features, device, use_cls_head=use_cls_head)
     final_metrics = {f"final_{key}": value for key, value in final_metrics.items()}
     metrics.update(final_metrics)
 
