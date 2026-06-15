@@ -1,5 +1,15 @@
+"""
+Fine-tune HF CLIP on SUN397 with GS-LoRA (gradient-SVD adaptive-rank LoRA).
+
+Uses the official SUN397 partition format (Training_01.txt / Testing_01.txt),
+matching the data loading of the OpenAI CLIP script exactly.
+
+Supports two loss modes:
+  --use_cls_head        [CLS] token + classifier head  (GoRA paper protocol)
+  (default)             standard CLIP contrastive loss with text prompts
+"""
+
 import argparse
-import csv
 import json
 import os
 import random
@@ -10,56 +20,61 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers import CLIPModel, CLIPProcessor, get_scheduler
 
 from gs_lora import GSLoraConfig, find_target_module_names, prepare_gslora_model
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Fine-tune CLIP for image classification with gradient-SVD adaptive-rank LoRA."
+        description="Fine-tune HF CLIP on SUN397 with gradient-SVD adaptive-rank LoRA."
     )
+    # --- Model & Data ---
     parser.add_argument("--model_name_or_path", type=str, required=True)
-    parser.add_argument("--dataset_name", type=str, default=None)
-    parser.add_argument("--dataset_config", type=str, default=None)
-    parser.add_argument("--dataset_dir", type=str, default=None)
-    parser.add_argument("--zhou_root", type=str, default=None)
-    parser.add_argument("--zhou_split_file", type=str, default=None)
-    parser.add_argument("--gtsrb_root", type=str, default=None)
-    parser.add_argument("--image_column", type=str, default="image")
-    parser.add_argument("--label_column", type=str, default="label")
-    parser.add_argument("--train_split", type=str, default="train")
-    parser.add_argument("--validation_split", type=str, default="validation")
-    parser.add_argument("--test_split", type=str, default=None)
+    parser.add_argument("--sun397_root", type=str, required=True,
+                        help="SUN397 root dir containing ClassName.txt and image subdirs")
+    parser.add_argument("--sun397_train_list", type=str, required=True,
+                        help="Path to Training_01.txt (official split)")
+    parser.add_argument("--sun397_test_list", type=str, required=True,
+                        help="Path to Testing_01.txt (official split)")
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--prompt_template", type=str, default=None)
-    parser.add_argument("--target_modules", nargs="+", default=["q_proj", "v_proj"])
+    parser.add_argument("--prompt_template", type=str, default="a photo of a {}.")
+    parser.add_argument("--use_cls_head", action="store_true",
+                        help="Use [CLS] token + classifier head (GoRA paper protocol)")
+
+    # --- GS-LoRA ---
+    parser.add_argument("--target_modules", nargs="+",
+                        default=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"])
     parser.add_argument("--target_prefix", type=str, default="vision_model")
     parser.add_argument("--base_rank", type=int, default=8)
     parser.add_argument("--tau", type=float, default=0.90)
-    parser.add_argument("--r_min", type=int, default=2)
-    parser.add_argument("--r_max", type=int, default=16)
+    parser.add_argument("--r_min", type=int, default=4)
+    parser.add_argument("--r_max", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
-    parser.add_argument(
-        "--init_method",
-        choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "gora_pinv"],
-        default="none",
-    )
-    parser.add_argument("--init_scale", type=float, default=1e-3)
+    parser.add_argument("--init_method",
+                        choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "gora_pinv"],
+                        default="svd_a_zero_b")
+    parser.add_argument("--init_scale", type=float, default=0.05)
     parser.add_argument("--gora_stable_gamma", type=float, default=5e-2)
     parser.add_argument("--gora_scale_by_lr", action="store_true")
     parser.add_argument("--gora_lr", type=float, default=5e-2)
     parser.add_argument("--no_compensate_scaling", action="store_true")
     parser.add_argument("--scaling_mode", choices=["rank", "sqrt_rank", "avg_rank"], default="rank")
-    parser.add_argument("--rank_budget_mode", choices=["independent", "param"], default="independent")
+    parser.add_argument("--rank_budget_mode", choices=["independent", "param"], default="param")
     parser.add_argument("--param_budget", type=int, default=None)
-    parser.add_argument("--calibration_steps", type=int, default=16)
-    parser.add_argument("--num_train_epochs", type=int, default=10)
+    parser.add_argument("--calibration_steps", type=int, default=64)
+    parser.add_argument("--skip_adaptive_rank", action="store_true")
+
+    # --- Training ---
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--per_device_train_batch_size", type=int, default=64)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=64)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -74,12 +89,13 @@ def parse_args():
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--train_logit_scale", action="store_true")
-    parser.add_argument("--skip_adaptive_rank", action="store_true")
-    parser.add_argument("--svhn_single_digit", action="store_true")
-    parser.add_argument("--use_cls_head", action="store_true",
-                        help="Use [CLS] token + classifier head (GoRA paper protocol)")
+
     return parser.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 class TeeLogger:
     def __init__(self, *streams):
@@ -94,134 +110,6 @@ class TeeLogger:
         for stream in self.streams:
             if not getattr(stream, "closed", False):
                 stream.flush()
-
-
-class SvhnSingleDigitDataset(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-        self.indices = [idx for idx, label in enumerate(dataset["label"]) if len(label["digit"]) == 1]
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        item = self.dataset[int(self.indices[int(idx)])]
-        digit = int(item["label"]["digit"][0])
-        return {
-            "image": item["image"].convert("RGB"),
-            "label": 0 if digit == 10 else digit,
-        }
-
-
-class ZhouSplitDataset(Dataset):
-    def __init__(self, root: str, split_file: str, split: str):
-        self.root = Path(root)
-        with open(split_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.samples = data[split]
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        rel_path, label, _ = self.samples[int(idx)]
-        image = Image.open(self.root / rel_path).convert("RGB")
-        return {"image": image, "label": int(label)}
-
-
-def get_zhou_class_names(split_file: str) -> List[str]:
-    with open(split_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    names = {}
-    for samples in data.values():
-        for _, label, class_name in samples:
-            names[int(label)] = str(class_name)
-    return [names[idx] for idx in sorted(names)]
-
-
-class GTSRBDataset(Dataset):
-    def __init__(self, root: str, split: str):
-        self.root = Path(root)
-        self.samples = []
-        if split == "train":
-            with open(self.root / "Train.csv", newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    self.samples.append((row["Path"], int(row["ClassId"])))
-        elif split == "test":
-            with open(self.root / "Test.csv", newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    self.samples.append((row["Path"], int(row["ClassId"])))
-        else:
-            raise ValueError(f"GTSRB supports train/test splits, got {split!r}")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        rel_path, label = self.samples[int(idx)]
-        image = Image.open(self.root / rel_path).convert("RGB")
-        return {"image": image, "label": label}
-
-
-GTSRB_CLASS_NAMES = [
-    "speed limit 20 km/h",
-    "speed limit 30 km/h",
-    "speed limit 50 km/h",
-    "speed limit 60 km/h",
-    "speed limit 70 km/h",
-    "speed limit 80 km/h",
-    "end of speed limit 80 km/h",
-    "speed limit 100 km/h",
-    "speed limit 120 km/h",
-    "no passing",
-    "no passing for vehicles over 3.5 metric tons",
-    "right-of-way at the next intersection",
-    "priority road",
-    "yield",
-    "stop",
-    "no vehicles",
-    "vehicles over 3.5 metric tons prohibited",
-    "no entry",
-    "general caution",
-    "dangerous curve to the left",
-    "dangerous curve to the right",
-    "double curve",
-    "bumpy road",
-    "slippery road",
-    "road narrows on the right",
-    "road work",
-    "traffic signals",
-    "pedestrians",
-    "children crossing",
-    "bicycles crossing",
-    "beware of ice or snow",
-    "wild animals crossing",
-    "end of all speed and passing limits",
-    "turn right ahead",
-    "turn left ahead",
-    "ahead only",
-    "go straight or right",
-    "go straight or left",
-    "keep right",
-    "keep left",
-    "roundabout mandatory",
-    "end of no passing",
-    "end of no passing by vehicles over 3.5 metric tons",
-]
-
-
-class VisionTransformDataset(Dataset):
-    def __init__(self, dataset, processor):
-        self.dataset = dataset
-        self.processor = processor
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        item = self.dataset[int(idx)]
-        pixel_values = self.processor(images=[item["image"]], return_tensors="pt")["pixel_values"][0]
-        return {"pixel_values": pixel_values, "labels": item["label"]}
 
 
 def setup_file_logging(output_dir: str):
@@ -241,67 +129,60 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def load_classification_dataset(args):
-    if args.zhou_root or args.zhou_split_file or args.gtsrb_root:
-        return None
+# ---------------------------------------------------------------------------
+# SUN397 official partition format
+# ---------------------------------------------------------------------------
 
-    if args.dataset_dir:
-        dataset = load_dataset("imagefolder", data_dir=args.dataset_dir)
-    elif args.dataset_name:
-        dataset = load_dataset(args.dataset_name, args.dataset_config)
-    else:
-        raise ValueError("Pass either --dataset_name or --dataset_dir.")
-
-    if args.validation_split not in dataset:
-        if "test" in dataset:
-            args.validation_split = "test"
-        else:
-            split = dataset[args.train_split].train_test_split(test_size=0.1, seed=args.seed)
-            dataset = {"train": split["train"], "validation": split["test"]}
-            args.train_split = "train"
-            args.validation_split = "validation"
-
-    return dataset
+def load_sun397_partition_class_names(root: str) -> List[str]:
+    """Load SUN397 class names from ClassName.txt (same format as OpenAI CLIP script)."""
+    with open(Path(root) / "ClassName.txt", encoding="utf-8") as f:
+        return [line.strip().lstrip("/") for line in f if line.strip()]
 
 
-def get_class_names(dataset, split: str, label_column: str) -> List[str]:
-    feature = dataset[split].features[label_column]
-    if hasattr(feature, "names") and feature.names is not None:
-        return list(feature.names)
+def load_sun397_partition_samples(root: str, list_path: str) -> List[tuple]:
+    """Load samples from a SUN397 partition file (Training_01.txt / Testing_01.txt).
 
-    labels = dataset[split][label_column]
-    unique_labels = sorted(set(labels))
-    return [str(label) for label in unique_labels]
+    Each line: a/abbey/sun_xxxx.jpg
+    Returns: [(full_path, label_int), ...]
+    """
+    root = Path(root)
+    class_names = load_sun397_partition_class_names(str(root))
+    class_to_label = {name: idx for idx, name in enumerate(class_names)}
+    samples = []
+    with open(list_path, encoding="utf-8") as f:
+        for line in f:
+            rel = line.strip().lstrip("/")
+            if not rel:
+                continue
+            class_name = str(Path(rel).parent)
+            if class_name not in class_to_label:
+                raise ValueError(f"Unknown SUN397 class in {list_path}: {class_name}")
+            path = root / rel
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            samples.append((str(path), class_to_label[class_name]))
+    return samples
 
 
-def infer_prompt_template(dataset_name: Optional[str], prompt_template: Optional[str]) -> str:
-    if prompt_template:
-        return prompt_template
-    return "a photo of a {}."
+class Sun397PartitionDataset(Dataset):
+    """SUN397 dataset reading from partition files (Training_01.txt / Testing_01.txt)."""
+    def __init__(self, samples: List[tuple], processor):
+        self.samples = samples
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[int(idx)]
+        image = Image.open(path).convert("RGB")
+        pixel_values = self.processor(images=[image], return_tensors="pt")["pixel_values"][0]
+        return {"pixel_values": pixel_values, "labels": label}
 
 
-def preprocess_dataset(dataset, processor, image_column: str, label_column: str):
-    def transform(examples):
-        raw_images = examples[image_column]
-        raw_labels = examples[label_column]
-        is_single = not isinstance(raw_images, list)
-        if is_single:
-            raw_images = [raw_images]
-            raw_labels = [raw_labels]
-
-        images = [image.convert("RGB") for image in raw_images]
-        pixel_values = processor(images=images, return_tensors="pt")["pixel_values"]
-        if is_single:
-            pixel_values = pixel_values[0]
-            raw_labels = raw_labels[0]
-        return {
-            "pixel_values": pixel_values,
-            "labels": raw_labels,
-        }
-
-    dataset.set_transform(transform)
-    return dataset
-
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
 
 def collate_fn(features):
     pixel_values = []
@@ -314,6 +195,18 @@ def collate_fn(features):
     labels = torch.tensor([feature["labels"] for feature in features], dtype=torch.long)
     return {"pixel_values": pixel_values, "labels": labels}
 
+
+def maybe_subset(dataset, max_samples: Optional[int], seed: int):
+    if max_samples is None or max_samples >= len(dataset):
+        return dataset
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator)[:max_samples].tolist()
+    return torch.utils.data.Subset(dataset, indices)
+
+
+# ---------------------------------------------------------------------------
+# CLIP helpers
+# ---------------------------------------------------------------------------
 
 def get_clip_backbone(model):
     if hasattr(model, "get_base_model"):
@@ -332,14 +225,8 @@ def to_float_tensor(output):
 
 
 @torch.no_grad()
-def build_text_features(
-    model,
-    processor,
-    class_names: List[str],
-    prompt_template: str,
-    device: torch.device,
-    batch_size: int = 128,
-) -> torch.Tensor:
+def build_text_features(model, processor, class_names: List[str], prompt_template: str,
+                        device: torch.device, batch_size: int = 128) -> torch.Tensor:
     model.eval()
     prompts = []
     for name in class_names:
@@ -352,7 +239,7 @@ def build_text_features(
     clip_model = get_clip_backbone(model)
 
     for start in range(0, len(prompts), batch_size):
-        batch_prompts = prompts[start : start + batch_size]
+        batch_prompts = prompts[start: start + batch_size]
         inputs = processor(text=batch_prompts, padding=True, return_tensors="pt").to(device)
         text_features = to_float_tensor(clip_model.get_text_features(**inputs))
         text_features = F.normalize(text_features, dim=-1)
@@ -361,7 +248,12 @@ def build_text_features(
     return torch.cat(features, dim=0)
 
 
+# ---------------------------------------------------------------------------
+# Loss functions
+# ---------------------------------------------------------------------------
+
 def clip_classification_loss(model, pixel_values, labels, text_features):
+    """Standard CLIP contrastive loss: image features @ text features."""
     clip_model = get_clip_backbone(model)
     image_features = to_float_tensor(clip_model.get_image_features(pixel_values=pixel_values))
     image_features = F.normalize(image_features, dim=-1)
@@ -372,9 +264,7 @@ def clip_classification_loss(model, pixel_values, labels, text_features):
 
 
 def cls_classification_loss(model, pixel_values, labels):
-    """[CLS] token + classifier head — matches GoRA paper protocol.
-    Manually computes image_features (vision → pooler → projection → L2 normalize)
-    because PeftModel wrapping can break get_image_features()."""
+    """[CLS] token + classifier head — GoRA paper protocol."""
     clip_model = get_clip_backbone(model)
     vision_outputs = clip_model.vision_model(pixel_values=pixel_values)
     pooled = vision_outputs.pooler_output
@@ -385,7 +275,12 @@ def cls_classification_loss(model, pixel_values, labels):
     return loss, logits
 
 
-def evaluate(model, dataloader, text_features, device: torch.device, use_cls_head: bool = False) -> Dict[str, float]:
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate(model, dataloader, text_features, device: torch.device,
+             use_cls_head: bool = False) -> Dict[str, float]:
     model.eval()
     if not use_cls_head:
         text_features = text_features.to(device)
@@ -411,6 +306,10 @@ def evaluate(model, dataloader, text_features, device: torch.device, use_cls_hea
         "loss": total_loss / max(total, 1),
     }
 
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
 
 def build_loraplus_param_groups(model, base_lr: float, ratio: float, weight_decay: float):
     lora_a_params = []
@@ -438,7 +337,8 @@ def build_loraplus_param_groups(model, base_lr: float, ratio: float, weight_deca
 
 def train(model, train_loader, eval_loader, text_features, args, device: torch.device,
           use_cls_head: bool = False):
-    param_groups = build_loraplus_param_groups(model, args.learning_rate, args.loraplus_lr_ratio, args.weight_decay)
+    param_groups = build_loraplus_param_groups(
+        model, args.learning_rate, args.loraplus_lr_ratio, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate, weight_decay=args.weight_decay)
     update_steps_per_epoch = max(
         1,
@@ -479,7 +379,8 @@ def train(model, train_loader, eval_loader, text_features, args, device: torch.d
                     loss, logits = clip_classification_loss(model, pixel_values, labels, text_features)
 
             scaler.scale(loss / args.gradient_accumulation_steps).backward()
-            should_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_loader)
+            should_step = ((step + 1) % args.gradient_accumulation_steps == 0
+                           or (step + 1) == len(train_loader))
             if should_step:
                 scaler.step(optimizer)
                 scaler.update()
@@ -509,20 +410,9 @@ def train(model, train_loader, eval_loader, text_features, args, device: torch.d
     return metrics
 
 
-def maybe_select(dataset, split: str, max_samples: Optional[int], seed: int):
-    data = dataset[split]
-    if max_samples is not None and max_samples < len(data):
-        data = data.shuffle(seed=seed).select(range(max_samples))
-    return data
-
-
-def maybe_subset(dataset, max_samples: Optional[int], seed: int):
-    if max_samples is None or max_samples >= len(dataset):
-        return dataset
-    generator = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(len(dataset), generator=generator)[:max_samples].tolist()
-    return Subset(dataset, indices)
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -532,67 +422,35 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
+    use_cls_head = args.use_cls_head
 
-    dataset = load_classification_dataset(args)
-    if args.zhou_root or args.zhou_split_file:
-        if not args.zhou_root or not args.zhou_split_file:
-            raise ValueError("Pass both --zhou_root and --zhou_split_file.")
-        class_names = get_zhou_class_names(args.zhou_split_file)
-    elif args.gtsrb_root:
-        class_names = GTSRB_CLASS_NAMES
-    elif args.svhn_single_digit:
-        class_names = [str(i) for i in range(10)]
-    else:
-        class_names = get_class_names(dataset, args.train_split, args.label_column)
+    # --- Data: SUN397 official partition format only ---
+    class_names = load_sun397_partition_class_names(args.sun397_root)
+    train_samples = load_sun397_partition_samples(args.sun397_root, args.sun397_train_list)
+    eval_samples = load_sun397_partition_samples(args.sun397_root, args.sun397_test_list)
 
-    dataset_hint = args.dataset_name or args.dataset_dir or args.zhou_root or args.gtsrb_root
-    prompt_template = infer_prompt_template(dataset_hint, args.prompt_template)
-
+    prompt_template = args.prompt_template
     processor = CLIPProcessor.from_pretrained(args.model_name_or_path)
     model = CLIPModel.from_pretrained(args.model_name_or_path, torch_dtype=dtype).to(device)
+
     target_module_names = find_target_module_names(model, args.target_modules, args.target_prefix)
 
-    eval_split = args.test_split or args.validation_split
-    if args.zhou_root:
-        train_data = ZhouSplitDataset(args.zhou_root, args.zhou_split_file, args.train_split)
-        eval_data = ZhouSplitDataset(args.zhou_root, args.zhou_split_file, eval_split)
-        train_data = VisionTransformDataset(maybe_subset(train_data, args.max_train_samples, args.seed), processor)
-        eval_data = VisionTransformDataset(maybe_subset(eval_data, args.max_eval_samples, args.seed), processor)
-    elif args.gtsrb_root:
-        train_data = GTSRBDataset(args.gtsrb_root, args.train_split)
-        eval_data = GTSRBDataset(args.gtsrb_root, eval_split)
-        train_data = VisionTransformDataset(maybe_subset(train_data, args.max_train_samples, args.seed), processor)
-        eval_data = VisionTransformDataset(maybe_subset(eval_data, args.max_eval_samples, args.seed), processor)
-    elif args.svhn_single_digit:
-        train_data = SvhnSingleDigitDataset(dataset[args.train_split])
-        eval_data = SvhnSingleDigitDataset(dataset[eval_split])
-        train_data = VisionTransformDataset(maybe_subset(train_data, args.max_train_samples, args.seed), processor)
-        eval_data = VisionTransformDataset(maybe_subset(eval_data, args.max_eval_samples, args.seed), processor)
-    else:
-        train_data = maybe_select(dataset, args.train_split, args.max_train_samples, args.seed)
-        eval_data = maybe_select(dataset, eval_split, args.max_eval_samples, args.seed)
-        train_data = preprocess_dataset(train_data, processor, args.image_column, args.label_column)
-        eval_data = preprocess_dataset(eval_data, processor, args.image_column, args.label_column)
+    train_data = Sun397PartitionDataset(train_samples, processor)
+    eval_data = Sun397PartitionDataset(eval_samples, processor)
+    train_data = maybe_subset(train_data, args.max_train_samples, args.seed)
+    eval_data = maybe_subset(eval_data, args.max_eval_samples, args.seed)
 
-    train_loader = DataLoader(
-        train_data,
-        batch_size=args.per_device_train_batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-    )
-    eval_loader = DataLoader(
-        eval_data,
-        batch_size=args.per_device_eval_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-    )
+    print(f"SUN397: {len(class_names)} classes, {len(train_data)} train, {len(eval_data)} test", flush=True)
 
-    # --- Add classifier head for [CLS] token classification (GoRA paper protocol) ---
-    use_cls_head = args.use_cls_head
+    train_loader = DataLoader(train_data, batch_size=args.per_device_train_batch_size,
+                              shuffle=True, num_workers=args.num_workers, collate_fn=collate_fn)
+    eval_loader = DataLoader(eval_data, batch_size=args.per_device_eval_batch_size,
+                             shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
+
+    # --- Build text features (shared across training) ---
     text_features = build_text_features(model, processor, class_names, prompt_template, device)
 
+    # --- GS-LoRA config ---
     config = GSLoraConfig(
         target_modules=args.target_modules,
         target_prefix=args.target_prefix,
@@ -616,11 +474,9 @@ def main():
     )
 
     def loss_fn(current_model, batch):
-        # Always use text-prompt loss for calibration (meaningful gradients)
         pixel_values = batch["pixel_values"].to(device)
         labels = batch["labels"].to(device)
-        loss, _ = clip_classification_loss(
-            current_model, pixel_values, labels, text_features.to(device))
+        loss, _ = clip_classification_loss(current_model, pixel_values, labels, text_features.to(device))
         return loss
 
     model, gs_report = prepare_gslora_model(
@@ -631,12 +487,9 @@ def main():
         device=device,
     )
 
-    # --- Add classifier head AFTER prepare_gslora_model (so it's on the right model) ---
+    # --- Classifier head (GoRA paper protocol) ---
     if use_cls_head:
-        # Use projected dim (512 for ViT-B/16), same as CLIP embedding space
         proj_dim = model.config.projection_dim
-        # Initialize classifier weight with text features (CLIP zero-shot weights)
-        # so 1-epoch training matches GoRA paper protocol
         model.classifier = nn.Linear(proj_dim, len(class_names), bias=False).to(device)
         with torch.no_grad():
             text_feats = build_text_features(model, processor, class_names, prompt_template, device)
@@ -650,6 +503,7 @@ def main():
     if hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
 
+    # --- Save GS-LoRA report ---
     rank_pattern = gs_report["rank_pattern"]
     rank_stats = gs_report["rank_stats"]
 
@@ -661,55 +515,50 @@ def main():
         json.dump(gs_report, f, indent=2)
     with open(os.path.join(args.output_dir, "class_names.json"), "w", encoding="utf-8") as f:
         json.dump(class_names, f, indent=2)
-    with open(os.path.join(args.output_dir, "run_config.json"), "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "model_name_or_path": args.model_name_or_path,
-                "dataset_name": args.dataset_name,
-                "dataset_config": args.dataset_config,
-                "dataset_dir": args.dataset_dir,
-                "zhou_root": args.zhou_root,
-                "zhou_split_file": args.zhou_split_file,
-                "gtsrb_root": args.gtsrb_root,
-                "train_split": args.train_split,
-                "validation_split": args.validation_split,
-                "test_split": args.test_split,
-                "prompt_template": prompt_template,
-                "target_module_names": target_module_names,
-                "target_modules": args.target_modules,
-                "target_prefix": args.target_prefix,
-                "base_rank": args.base_rank,
-                "tau": args.tau,
-                "r_min": args.r_min,
-                "r_max": args.r_max,
-                "lora_alpha": args.lora_alpha,
-                "lora_dropout": args.lora_dropout,
-                "gradient_accumulation_steps": args.gradient_accumulation_steps,
-                "num_train_epochs": args.num_train_epochs,
-                "per_device_train_batch_size": args.per_device_train_batch_size,
-                "per_device_eval_batch_size": args.per_device_eval_batch_size,
-                "learning_rate": args.learning_rate,
-                "loraplus_lr_ratio": args.loraplus_lr_ratio,
-                "weight_decay": args.weight_decay,
-                "warmup_ratio": args.warmup_ratio,
-                "calibration_steps": args.calibration_steps,
-                "seed": args.seed,
-                "init_method": args.init_method,
-                "init_scale": args.init_scale,
-                "gora_stable_gamma": args.gora_stable_gamma,
-                "gora_scale_by_lr": args.gora_scale_by_lr,
-                "gora_lr": args.gora_lr,
-                "compensate_scaling": not args.no_compensate_scaling,
-                "scaling_mode": args.scaling_mode,
-                "rank_budget_mode": args.rank_budget_mode,
-                "param_budget": args.param_budget,
-                "skip_adaptive_rank": args.skip_adaptive_rank,
-                "svhn_single_digit": args.svhn_single_digit,
-            },
-            f,
-            indent=2,
-        )
 
+    # --- Save run config ---
+    with open(os.path.join(args.output_dir, "run_config.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "model_name_or_path": args.model_name_or_path,
+            "sun397_root": args.sun397_root,
+            "sun397_train_list": args.sun397_train_list,
+            "sun397_test_list": args.sun397_test_list,
+            "prompt_template": prompt_template,
+            "use_cls_head": use_cls_head,
+            "target_module_names": target_module_names,
+            "target_modules": args.target_modules,
+            "target_prefix": args.target_prefix,
+            "base_rank": args.base_rank,
+            "tau": args.tau,
+            "r_min": args.r_min,
+            "r_max": args.r_max,
+            "lora_alpha": args.lora_alpha,
+            "lora_dropout": args.lora_dropout,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "num_train_epochs": args.num_train_epochs,
+            "per_device_train_batch_size": args.per_device_train_batch_size,
+            "per_device_eval_batch_size": args.per_device_eval_batch_size,
+            "learning_rate": args.learning_rate,
+            "loraplus_lr_ratio": args.loraplus_lr_ratio,
+            "weight_decay": args.weight_decay,
+            "warmup_ratio": args.warmup_ratio,
+            "calibration_steps": args.calibration_steps,
+            "seed": args.seed,
+            "init_method": args.init_method,
+            "init_scale": args.init_scale,
+            "gora_stable_gamma": args.gora_stable_gamma,
+            "gora_scale_by_lr": args.gora_scale_by_lr,
+            "gora_lr": args.gora_lr,
+            "compensate_scaling": not args.no_compensate_scaling,
+            "scaling_mode": args.scaling_mode,
+            "rank_budget_mode": args.rank_budget_mode,
+            "param_budget": args.param_budget,
+            "skip_adaptive_rank": args.skip_adaptive_rank,
+            "fp16": args.fp16,
+            "bf16": args.bf16,
+        }, f, indent=2)
+
+    # --- Train ---
     metrics = train(model, train_loader, eval_loader, text_features, args, device,
                     use_cls_head=use_cls_head)
     final_metrics = evaluate(model, eval_loader, text_features, device, use_cls_head=use_cls_head)
@@ -718,8 +567,10 @@ def main():
 
     with open(os.path.join(args.output_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+
     processor.save_pretrained(args.output_dir)
     model.save_pretrained(os.path.join(args.output_dir, "last_adapter"))
+
     sys.stdout = original_stdout
     sys.stderr = original_stderr
     log_file.close()
