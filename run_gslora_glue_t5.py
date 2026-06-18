@@ -52,7 +52,7 @@ TASK_TO_KEYS: Dict[str, Tuple[str, Optional[str]]] = {
     "mrpc": ("sentence1", "sentence2"),
 }
 
-LABEL_TEXT = {
+GS_LABEL_TEXT = {
     "sst2": {0: "negative", 1: "positive"},
     "cola": {0: "unacceptable", 1: "acceptable"},
     "qnli": {0: "entailment", 1: "not_entailment"},
@@ -60,14 +60,14 @@ LABEL_TEXT = {
     "mnli": {0: "entailment", 1: "neutral", 2: "contradiction"},
 }
 
-
-TASK_INSTRUCTION = {
-    "mnli": "classify the semantic similarity of the text: ",
-    "sst2": "classify the sentiment of the text: ",
-    "cola": "classify the grammaticality of the text: ",
-    "qnli": "classify the semantic similarity of the question and the sentence: ",
-    "mrpc": "classify the semantic similarity of the text: ",
+LORAGA_LABEL_TEXT = {
+    "sst2": {0: "negative", 1: "positive"},
+    "cola": {0: "unacceptable", 1: "acceptable"},
+    "qnli": {0: "entailment", 1: "not_entailment"},
+    "mrpc": {0: "different", 1: "equivalent"},
+    "mnli": {0: "entailment", 1: "neutral", 2: "contradiction"},
 }
+
 
 
 def parse_args():
@@ -94,6 +94,12 @@ def parse_args():
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--report_to", type=str, default="none")
     p.add_argument("--generation_max_length", type=int, default=32)
+    p.add_argument("--glue_format", type=str, default="gs", choices=["gs", "loraga"])
+    p.add_argument("--metric_style", type=str, default="official_generate", choices=["official_generate", "loraga_logits"])
+    p.add_argument("--mask_label_padding", action="store_true", default=True)
+    p.add_argument("--no_mask_label_padding", action="store_false", dest="mask_label_padding")
+    p.add_argument("--max_train_samples", type=int, default=None)
+    p.add_argument("--max_eval_samples", type=int, default=None)
 
     # GS-LoRA / LoRA args. Keep GS-LoRA's adaptive-rank and SVD-init path as the method under test.
     p.add_argument("--target_modules", nargs="+", default=["q", "k", "v", "o", "wi", "wo"])
@@ -104,10 +110,13 @@ def parse_args():
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--calibration_steps", type=int, default=64)
-    p.add_argument("--init_method", type=str, default="svd_a_zero_b", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b"])
+    p.add_argument("--init_method", type=str, default="svd_a_zero_b", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "svd_a_energy_zero_b", "svd_a_energy_small_b"])
     p.add_argument("--rank_budget_mode", type=str, default="independent", choices=["independent", "param"])
     p.add_argument("--param_budget", type=int, default=None)
     p.add_argument("--init_scale", type=float, default=1.0)
+    p.add_argument("--init_energy_beta", type=float, default=0.5)
+    p.add_argument("--init_energy_eps", type=float, default=1e-8)
+    p.add_argument("--init_small_b_scale", type=float, default=1e-4)
     p.add_argument("--scaling_mode", type=str, default="rank", choices=["rank", "sqrt_rank", "avg_rank"])
     p.add_argument("--skip_adaptive_rank", action="store_true")
     p.add_argument("--no_gslora", action="store_true")
@@ -117,15 +126,57 @@ def parse_args():
     return p.parse_args()
 
 
-def build_prompt(task_name: str, ex: dict) -> str:
-    a, b = TASK_TO_KEYS[task_name]
-    prompt = f"{TASK_INSTRUCTION[task_name]}{ex[a]}"
-    if b is not None:
-        prompt += f"\n{ex[b]}"
-    return prompt + "\nresult: "
+def label_text_for_format(glue_format: str):
+    return LORAGA_LABEL_TEXT if glue_format == "loraga" else GS_LABEL_TEXT
 
 
-def preprocess_datasets(task_name: str, tokenizer, max_source_length: int, max_target_length: int, glue_root: str):
+def build_prompt(task_name: str, ex: dict, glue_format: str = "gs") -> str:
+    if glue_format == "loraga":
+        if task_name == "cola":
+            return f"classify the grammaticality of the text: {ex['sentence']}\nresult: "
+        if task_name == "sst2":
+            return f"classify the sentiment of the text: {ex['sentence']}\nresult: "
+        if task_name == "qnli":
+            return (
+                "classify the semantic similarity of the question and the sentence: "
+                f"{ex['question']}\n{ex['sentence']}\nresult: "
+            )
+        if task_name == "mrpc":
+            return (
+                "classify the semantic similarity of the text: "
+                f"{ex['sentence1']}\n{ex['sentence2']}\nresult: "
+            )
+        if task_name == "mnli":
+            return (
+                "classify the semantic similarity of the text: "
+                f"{ex['premise']}\n{ex['hypothesis']}\nresult: "
+            )
+        raise ValueError(f"Unsupported GLUE task: {task_name}")
+
+    if task_name == "cola":
+        return f"cola sentence: {ex['sentence']}"
+    if task_name == "sst2":
+        return f"sst2 sentence: {ex['sentence']}"
+    if task_name == "qnli":
+        return f"qnli question: {ex['question']} sentence: {ex['sentence']}"
+    if task_name == "mrpc":
+        return f"mrpc sentence1: {ex['sentence1']} sentence2: {ex['sentence2']}"
+    if task_name == "mnli":
+        return f"mnli hypothesis: {ex['hypothesis']} premise: {ex['premise']}"
+    raise ValueError(f"Unsupported GLUE task: {task_name}")
+
+
+def preprocess_datasets(
+    task_name: str,
+    tokenizer,
+    max_source_length: int,
+    max_target_length: int,
+    glue_root: str,
+    glue_format: str,
+    mask_label_padding: bool,
+    max_train_samples: Optional[int] = None,
+    max_eval_samples: Optional[int] = None,
+):
     local_task_dir = Path(glue_root) / task_name
     if local_task_dir.exists():
         print(f"[INFO] Loading local GLUE dataset from {local_task_dir}")
@@ -134,41 +185,50 @@ def preprocess_datasets(task_name: str, tokenizer, max_source_length: int, max_t
         print(f"[INFO] Local GLUE dataset not found at {local_task_dir}, fallback to Hugging Face")
         raw_all = load_dataset("glue", task_name)
 
+    label_text = label_text_for_format(glue_format)
+
     def preprocess(examples):
         inputs, targets = [], []
         for i in range(len(examples["label"])):
             ex = {k: examples[k][i] for k in examples.keys()}
-            inputs.append(build_prompt(task_name, ex))
+            inputs.append(build_prompt(task_name, ex, glue_format=glue_format))
             label_id = int(examples["label"][i])
 
             # GLUE test split has label = -1. We do not train/eval on test,
             # but keep preprocessing robust.
             if label_id == -1:
-                targets.append(list(LABEL_TEXT[task_name].values())[0])
+                targets.append(list(label_text[task_name].values())[0])
             else:
-                targets.append(LABEL_TEXT[task_name][label_id])
+                targets.append(label_text[task_name][label_id])
 
+        padding_mode = False if glue_format == "loraga" else "max_length"
         model_inputs = tokenizer(
             inputs,
             max_length=max_source_length,
             truncation=True,
-            padding="max_length",
+            padding=padding_mode,
         )
         try:
             labels = tokenizer(
                 text_target=targets,
                 max_length=max_target_length,
                 truncation=True,
-                padding="max_length",
+                padding=padding_mode,
             )
         except TypeError:
             labels = tokenizer(
                 targets,
                 max_length=max_target_length,
                 truncation=True,
-                padding="max_length",
+                padding=padding_mode,
             )
-        model_inputs["labels"] = labels["input_ids"]
+        label_ids = labels["input_ids"]
+        if mask_label_padding:
+            label_ids = [
+                [(token_id if token_id != tokenizer.pad_token_id else -100) for token_id in row]
+                for row in label_ids
+            ]
+        model_inputs["labels"] = label_ids
         return model_inputs
 
     keep_splits = ["train"]
@@ -177,7 +237,13 @@ def preprocess_datasets(task_name: str, tokenizer, max_source_length: int, max_t
     else:
         keep_splits += ["validation"]
 
-    raw = {k: raw_all[k] for k in keep_splits}
+    raw = {}
+    for split_name in keep_splits:
+        ds = raw_all[split_name]
+        limit = max_train_samples if split_name == "train" else max_eval_samples
+        if limit is not None:
+            ds = ds.select(range(min(int(limit), len(ds))))
+        raw[split_name] = ds
     tokenized = {}
     for split_name, ds in raw.items():
         tokenized[split_name] = ds.map(
@@ -199,6 +265,9 @@ def build_model(args, tokenizer, train_dataset):
 
     if not args.no_gslora and _GSLORA_AVAILABLE and _GSLORA_PREPARE is not None:
         print("[DEBUG] Trying GS-LoRA path ...")
+        prepare_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        print("[DEBUG] GS-LoRA prepare_device =", prepare_device)
+        model.to(prepare_device)
         collator = DataCollatorForSeq2Seq(
             tokenizer,
             model=model,
@@ -220,6 +289,10 @@ def build_model(args, tokenizer, train_dataset):
             batches.append(collator(buf))
 
         def loss_fn(m, batch):
+            batch = {
+                key: value.to(prepare_device) if hasattr(value, "to") else value
+                for key, value in batch.items()
+            }
             outputs = m(**batch)
             return outputs.loss
 
@@ -239,7 +312,9 @@ def build_model(args, tokenizer, train_dataset):
                 rank_budget_mode=args.rank_budget_mode,
                 param_budget=args.param_budget,
                 init_scale=args.init_scale,
-                compensate_scaling=True,
+                init_energy_beta=args.init_energy_beta,
+                init_energy_eps=args.init_energy_eps,
+                init_small_b_scale=args.init_small_b_scale,
                 scaling_mode=args.scaling_mode,
             )
             print("[DEBUG] GSLoRAConfig =", gslora_config)
@@ -249,7 +324,7 @@ def build_model(args, tokenizer, train_dataset):
                 dataloader=batches,
                 loss_fn=loss_fn,
                 config=gslora_config,
-                device=None,
+                device=prepare_device,
             )
 
             if isinstance(prepared, tuple):
@@ -311,7 +386,7 @@ def normalize_text(s: str) -> str:
 
 def compute_metrics_builder(task_name: str, tokenizer):
     metric = evaluate.load("glue", task_name)
-    inv = {normalize_text(v): k for k, v in LABEL_TEXT[task_name].items()}
+    inv = {normalize_text(v): k for k, v in GS_LABEL_TEXT[task_name].items()}
 
     def compute_metrics(eval_pred):
         preds, labels = eval_pred
@@ -328,6 +403,40 @@ def compute_metrics_builder(task_name: str, tokenizer):
             label_ids.append(inv[normalize_text(label_text)])
 
         return metric.compute(predictions=pred_ids, references=label_ids)
+
+    return compute_metrics
+
+
+def compute_loraga_logits_metrics_builder(task_name: str, tokenizer, glue_format: str):
+    label_text = label_text_for_format(glue_format)[task_name]
+    label_token_ids = {}
+    for label_id, text in label_text.items():
+        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if not token_ids:
+            raise ValueError(f"Label text produced no tokens: {text!r}")
+        label_token_ids[int(label_id)] = int(token_ids[0])
+    candidate_label_ids = sorted(label_token_ids)
+    candidate_token_ids = np.asarray([label_token_ids[label_id] for label_id in candidate_label_ids])
+
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        if isinstance(predictions, tuple):
+            predictions = predictions[0]
+        logits = np.asarray(predictions)
+        labels = np.asarray(labels)
+        if logits.ndim != 3:
+            raise ValueError(f"Expected logits with shape [batch, seq, vocab], got {logits.shape}")
+
+        first_label_tokens = labels[:, 0]
+        token_to_label = {token_id: label_id for label_id, token_id in label_token_ids.items()}
+        gold = np.asarray([token_to_label.get(int(token_id), -1) for token_id in first_label_tokens])
+
+        candidate_logits = logits[:, 0, candidate_token_ids]
+        pred_indices = np.argmax(candidate_logits, axis=-1)
+        pred = np.asarray([candidate_label_ids[int(index)] for index in pred_indices])
+        valid = gold >= 0
+        accuracy = float((pred[valid] == gold[valid]).mean()) if valid.any() else 0.0
+        return {"accuracy": accuracy}
 
     return compute_metrics
 
@@ -383,6 +492,10 @@ def main():
         args.max_source_length,
         args.max_target_length,
         args.glue_root,
+        args.glue_format,
+        args.mask_label_padding,
+        args.max_train_samples,
+        args.max_eval_samples,
     )
 
     eval_dataset = tok["validation_matched"] if args.task_name == "mnli" else tok["validation"]
@@ -426,7 +539,7 @@ def main():
         logging_steps=args.logging_steps,
         report_to=[] if args.report_to == "none" else [args.report_to],
         load_best_model_at_end=(args.evaluation_strategy != "no"),
-        predict_with_generate=True,
+        predict_with_generate=(args.metric_style == "official_generate"),
         generation_max_length=args.generation_max_length,
         fp16=args.fp16,
         bf16=args.bf16,
@@ -449,7 +562,11 @@ def main():
         train_dataset=tok["train"],
         eval_dataset=eval_dataset,
         data_collator=collator,
-        compute_metrics=compute_metrics_builder(args.task_name, tokenizer),
+        compute_metrics=(
+            compute_loraga_logits_metrics_builder(args.task_name, tokenizer, args.glue_format)
+            if args.metric_style == "loraga_logits"
+            else compute_metrics_builder(args.task_name, tokenizer)
+        ),
     )
     if args.use_loraplus:
         optimizer = build_loraplus_optimizer(

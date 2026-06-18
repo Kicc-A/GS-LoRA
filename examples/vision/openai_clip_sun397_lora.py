@@ -54,10 +54,21 @@ class RankConfig:
         self.base_rank = base_rank
 
 
-def allocate_param_budget(singular_values, rank_costs, r_min, r_max, param_budget):
+def allocate_param_budget(
+    singular_values,
+    rank_costs,
+    r_min,
+    r_max,
+    param_budget,
+    score_weights=None,
+    min_rank_overrides=None,
+):
     ranks = {}
     for name, values in singular_values.items():
-        ranks[name] = min(r_min, int(values.numel()), r_max)
+        min_rank = r_min
+        if min_rank_overrides is not None:
+            min_rank = min_rank_overrides.get(name, r_min)
+        ranks[name] = min(int(min_rank), int(values.numel()), r_max)
 
     def total_cost():
         return sum(ranks[name] * rank_costs[name] for name in ranks)
@@ -74,6 +85,8 @@ def allocate_param_budget(singular_values, rank_costs, r_min, r_max, param_budge
             if next_rank >= min(int(values.numel()), r_max) or current + cost > budget:
                 continue
             score = values[next_rank].pow(2).item() / cost
+            if score_weights is not None:
+                score = score * float(score_weights.get(name, 1.0))
             if best_score is None or score > best_score:
                 best_name = name
                 best_score = score
@@ -81,6 +94,45 @@ def allocate_param_budget(singular_values, rank_costs, r_min, r_max, param_budge
             break
         ranks[best_name] += 1
     return ranks
+
+
+def build_score_weights(grad_cache, rank_score_mode):
+    if rank_score_mode == "spectral":
+        return None
+
+    raw_scores = {}
+    for name, item in grad_cache.items():
+        grad = item["grad"].detach().float().reshape(item["grad"].shape[0], -1)
+        weight = item["weight"].detach().float().reshape(item["weight"].shape[0], -1)
+        if rank_score_mode == "spectral_gradnorm":
+            raw_scores[name] = grad.norm().item()
+        else:
+            raw_scores[name] = torch.mean(torch.abs(weight * grad)).item()
+
+    values = torch.tensor(list(raw_scores.values()), dtype=torch.float32)
+    mean = values.mean().clamp_min(1e-12).item()
+    return {name: max(0.5, min(2.0, score / mean)) for name, score in raw_scores.items()}
+
+
+def rank_scaling(alpha, rank, scaling_mode="rank", avg_rank=None, scaling_power=1.0, scaling_base_rank=8.0):
+    rank = int(rank)
+    if rank <= 0:
+        return 1.0
+    if scaling_mode == "sqrt_rank":
+        return alpha / float(rank) ** 0.5
+    if scaling_mode == "power_rank":
+        return alpha / float(rank) ** float(scaling_power)
+    if scaling_mode == "centered_power":
+        base = max(float(scaling_base_rank), 1e-12)
+        return (alpha / rank) * ((float(rank) / base) ** float(scaling_power))
+    if scaling_mode == "high_rank_boost":
+        base = max(float(scaling_base_rank), 1e-12)
+        boost = max(1.0, (float(rank) / base) ** float(scaling_power))
+        return (alpha / rank) * boost
+    if scaling_mode == "avg_rank":
+        denom = float(avg_rank) if avg_rank is not None and avg_rank > 0 else float(rank)
+        return alpha / denom
+    return alpha / rank
 
 
 def allocate_independent_capped(singular_values, rank_costs, tau, r_min, r_max, param_budget, min_rank_overrides=None):
@@ -183,6 +235,7 @@ def compensated_svd_direction_factors(grad, weight, rank, init_scale, effective_
     return factors
 
 
+
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -243,6 +296,8 @@ class ImagePathDataset(Dataset):
 
 
 class SvhnSingleDigitDataset(Dataset):
+    """SVHN street-view (Format 2), filtered to single-digit crops only."""
+
     def __init__(self, dataset, preprocess):
         self.dataset = dataset
         self.preprocess = preprocess
@@ -260,6 +315,24 @@ class SvhnSingleDigitDataset(Dataset):
         digit = int(item["label"]["digit"][0])
         label = 0 if digit == 10 else digit
         return self.preprocess(item["image"].convert("RGB")), label
+
+
+class SvhnFormat1Dataset(Dataset):
+    """Official SVHN Format 1 (32x32 cropped digits) via torchvision.
+    Label 10 → digit 0."""
+    def __init__(self, root, split, preprocess):
+        from torchvision.datasets import SVHN
+        is_train = (split == "train")
+        self.dataset = SVHN(root, split="train" if is_train else "test", download=False)
+        self.preprocess = preprocess
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[int(idx)]
+        label = 0 if label == 10 else int(label)
+        return self.preprocess(image), label
 
 
 def build_dtd_split(root, split_file, train_split, test_split):
@@ -306,6 +379,37 @@ def build_zhou_image_split(root, split_file, train_split, test_split):
     return class_names, train_samples, test_samples
 
 
+def _resolve_imagefolder_split_dir(root, split_name):
+    split_dir = Path(root) / split_name
+    nested = split_dir / split_name
+    if nested.is_dir():
+        return nested
+    if split_dir.is_dir():
+        return split_dir
+    raise FileNotFoundError(split_dir)
+
+
+def build_imagefolder_split(root, train_split, test_split):
+    train_dir = _resolve_imagefolder_split_dir(root, train_split)
+    test_dir = _resolve_imagefolder_split_dir(root, test_split)
+    class_names = sorted(path.name for path in train_dir.iterdir() if path.is_dir())
+    class_to_label = {name: idx for idx, name in enumerate(class_names)}
+    extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    def read_dir(split_dir):
+        samples = []
+        for class_name in class_names:
+            class_dir = split_dir / class_name
+            if not class_dir.is_dir():
+                raise FileNotFoundError(class_dir)
+            for path in sorted(class_dir.rglob("*")):
+                if path.is_file() and path.suffix.lower() in extensions:
+                    samples.append((str(path), class_to_label[class_name]))
+        return samples
+
+    return class_names, read_dir(train_dir), read_dir(test_dir)
+
+
 def format_class_name(name):
     # Strip SUN397 subdirectory prefix (e.g., 'a/abbey' -> 'abbey',
     # 'a/apartment_building/outdoor' -> 'apartment_building/outdoor')
@@ -316,12 +420,14 @@ def format_class_name(name):
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, source: nn.Linear, rank, alpha, dropout):
+    def __init__(self, source: nn.Linear, rank, alpha, dropout, scaling_mode="rank", avg_rank=None, scaling_power=1.0, scaling_base_rank=8.0):
         super().__init__()
         self.weight = nn.Parameter(source.weight.detach().clone())
         self.bias = nn.Parameter(source.bias.detach().clone()) if source.bias is not None else None
         self.rank = int(rank)
-        self.scaling = alpha / self.rank if self.rank > 0 else 1.0
+        self.base_scaling = rank_scaling(alpha, self.rank, "rank", avg_rank, scaling_power, scaling_base_rank)
+        self.target_scaling = rank_scaling(alpha, self.rank, scaling_mode, avg_rank, scaling_power, scaling_base_rank)
+        self.scaling = self.target_scaling
         self.lora_dropout = nn.Dropout(dropout)
         if self.rank > 0:
             self.lora_A = nn.Parameter(torch.empty(self.rank, source.in_features))
@@ -331,6 +437,10 @@ class LoRALinear(nn.Module):
             self.lora_A = None
             self.lora_B = None
 
+    def set_scaling_progress(self, progress):
+        progress = float(max(0.0, min(1.0, progress)))
+        self.scaling = self.base_scaling + (self.target_scaling - self.base_scaling) * progress
+
     def forward(self, x):
         out = F.linear(x, self.weight, self.bias)
         if self.rank > 0:
@@ -339,7 +449,7 @@ class LoRALinear(nn.Module):
 
 
 class LoRAMultiheadAttention(nn.Module):
-    def __init__(self, source: nn.MultiheadAttention, rank_pattern, alpha, dropout):
+    def __init__(self, source: nn.MultiheadAttention, rank_pattern, alpha, dropout, scaling_mode="rank", avg_rank=None, scaling_power=1.0, scaling_base_rank=8.0):
         super().__init__()
         self.embed_dim = source.embed_dim
         self.num_heads = source.num_heads
@@ -348,7 +458,7 @@ class LoRAMultiheadAttention(nn.Module):
         self.in_proj_weight = nn.Parameter(source.in_proj_weight.detach().clone())
         self.in_proj_bias = nn.Parameter(source.in_proj_bias.detach().clone()) if source.in_proj_bias is not None else None
         self.out_rank = int(rank_pattern.get("out", 0))
-        self.out_proj = LoRALinear(source.out_proj, self.out_rank, alpha, dropout)
+        self.out_proj = LoRALinear(source.out_proj, self.out_rank, alpha, dropout, scaling_mode, avg_rank, scaling_power, scaling_base_rank)
         self.lora_dropout = nn.Dropout(dropout)
         self.q_rank = int(rank_pattern.get("q", 0))
         self.k_rank = int(rank_pattern.get("k", 0))
@@ -356,9 +466,15 @@ class LoRAMultiheadAttention(nn.Module):
         self.q_A, self.q_B = self._make_lora(self.q_rank)
         self.k_A, self.k_B = self._make_lora(self.k_rank)
         self.v_A, self.v_B = self._make_lora(self.v_rank)
-        self.q_scaling = alpha / self.q_rank if self.q_rank > 0 else 1.0
-        self.k_scaling = alpha / self.k_rank if self.k_rank > 0 else 1.0
-        self.v_scaling = alpha / self.v_rank if self.v_rank > 0 else 1.0
+        self.q_base_scaling = rank_scaling(alpha, self.q_rank, "rank", avg_rank, scaling_power, scaling_base_rank)
+        self.k_base_scaling = rank_scaling(alpha, self.k_rank, "rank", avg_rank, scaling_power, scaling_base_rank)
+        self.v_base_scaling = rank_scaling(alpha, self.v_rank, "rank", avg_rank, scaling_power, scaling_base_rank)
+        self.q_target_scaling = rank_scaling(alpha, self.q_rank, scaling_mode, avg_rank, scaling_power, scaling_base_rank)
+        self.k_target_scaling = rank_scaling(alpha, self.k_rank, scaling_mode, avg_rank, scaling_power, scaling_base_rank)
+        self.v_target_scaling = rank_scaling(alpha, self.v_rank, scaling_mode, avg_rank, scaling_power, scaling_base_rank)
+        self.q_scaling = self.q_target_scaling
+        self.k_scaling = self.k_target_scaling
+        self.v_scaling = self.v_target_scaling
 
     def _make_lora(self, rank):
         if rank <= 0:
@@ -367,6 +483,13 @@ class LoRAMultiheadAttention(nn.Module):
         b = nn.Parameter(torch.zeros(self.embed_dim, rank))
         nn.init.kaiming_uniform_(a, a=np.sqrt(5))
         return a, b
+
+    def set_scaling_progress(self, progress):
+        progress = float(max(0.0, min(1.0, progress)))
+        self.q_scaling = self.q_base_scaling + (self.q_target_scaling - self.q_base_scaling) * progress
+        self.k_scaling = self.k_base_scaling + (self.k_target_scaling - self.k_base_scaling) * progress
+        self.v_scaling = self.v_base_scaling + (self.v_target_scaling - self.v_base_scaling) * progress
+        self.out_proj.set_scaling_progress(progress)
 
     def forward(self, query, key, value, need_weights=False, attn_mask=None, **kwargs):
         if query is not key or key is not value:
@@ -401,7 +524,9 @@ class OpenAIClipClassifier(nn.Module):
         self.visual = self.clip_model.visual
         self.logit_scale = self.clip_model.logit_scale
 
-    def inject_lora(self, rank_pattern, alpha, dropout):
+    def inject_lora(self, rank_pattern, alpha, dropout, scaling_mode="rank", scaling_power=1.0, scaling_base_rank=8.0):
+        active_ranks = [int(rank) for rank in rank_pattern.values() if int(rank) > 0]
+        avg_rank = sum(active_ranks) / len(active_ranks) if active_ranks else None
         for idx, block in enumerate(self.visual.transformer.resblocks):
             ranks = {
                 "q": rank_pattern.get(f"visual.transformer.resblocks.{idx}.attn.q", 0),
@@ -409,18 +534,26 @@ class OpenAIClipClassifier(nn.Module):
                 "v": rank_pattern.get(f"visual.transformer.resblocks.{idx}.attn.v", 0),
                 "out": rank_pattern.get(f"visual.transformer.resblocks.{idx}.attn.out_proj", 0),
             }
-            block.attn = LoRAMultiheadAttention(block.attn, ranks, alpha, dropout)
+            block.attn = LoRAMultiheadAttention(block.attn, ranks, alpha, dropout, scaling_mode, avg_rank, scaling_power, scaling_base_rank)
             block.mlp.c_fc = LoRALinear(
                 block.mlp.c_fc,
                 rank_pattern.get(f"visual.transformer.resblocks.{idx}.mlp.c_fc", 0),
                 alpha,
                 dropout,
+                scaling_mode,
+                avg_rank,
+                scaling_power,
+                scaling_base_rank,
             )
             block.mlp.c_proj = LoRALinear(
                 block.mlp.c_proj,
                 rank_pattern.get(f"visual.transformer.resblocks.{idx}.mlp.c_proj", 0),
                 alpha,
                 dropout,
+                scaling_mode,
+                avg_rank,
+                scaling_power,
+                scaling_base_rank,
             )
         self.freeze_backbone()
 
@@ -442,6 +575,11 @@ class OpenAIClipClassifier(nn.Module):
                 if module.lora_A is not None:
                     module.lora_A.requires_grad = True
                     module.lora_B.requires_grad = True
+
+    def set_lora_scaling_progress(self, progress):
+        for module in self.visual.modules():
+            if isinstance(module, (LoRAMultiheadAttention, LoRALinear)):
+                module.set_scaling_progress(progress)
 
     def forward(self, images):
         return self.visual(images)
@@ -533,7 +671,9 @@ def _compensate_weight_(weight, lora_a, lora_b, scaling):
     weight.sub_(delta)
 
 
-def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_method):
+def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_method, scaling_mode="rank", scaling_power=1.0, scaling_base_rank=8.0):
+    active_ranks = [int(rank) for rank in rank_pattern.values() if int(rank) > 0]
+    avg_rank = sum(active_ranks) / len(active_ranks) if active_ranks else None
     modules = {}
     for idx, block in enumerate(model.visual.transformer.resblocks):
         modules[f"visual.transformer.resblocks.{idx}.attn"] = block.attn
@@ -543,10 +683,10 @@ def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_meth
     start = time.time()
     for name, item in grad_cache.items():
         rank = int(rank_pattern[name])
-        scaling = alpha / rank if rank > 0 else 1.0
+        scaling = rank_scaling(alpha, rank, scaling_mode, avg_rank, scaling_power, scaling_base_rank)
         if init_method == "svd_compensated":
             factors = compensated_svd_factors(item["grad"], item["weight"], rank, init_scale, scaling)
-        elif init_method == "svd_compensated_svd":
+        elif init_method in ("svd_compensated_svd", "spectral_grad", "spectral_grad_compensated"):
             factors = compensated_svd_direction_factors(item["grad"], item["weight"], rank, init_scale, scaling)
         else:
             factors = svd_lora_factors(item["grad"], item["weight"], rank, init_scale, scaling, init_method)
@@ -557,7 +697,7 @@ def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_meth
             if isinstance(module, LoRALinear):
                 module.lora_A.copy_(factors["lora_A"].to(module.lora_A.device, module.lora_A.dtype))
                 module.lora_B.copy_(factors["lora_B"].to(module.lora_B.device, module.lora_B.dtype))
-                if init_method.startswith("svd_compensated"):
+                if init_method.startswith("svd_compensated") or init_method == "spectral_grad_compensated":
                     _compensate_weight_(module.weight, module.lora_A, module.lora_B, scaling)
                 continue
             module_name, which = name.rsplit(".", 1)
@@ -565,17 +705,17 @@ def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_meth
             if which == "q":
                 module.q_A.copy_(factors["lora_A"].to(module.q_A.device, module.q_A.dtype))
                 module.q_B.copy_(factors["lora_B"].to(module.q_B.device, module.q_B.dtype))
-                if init_method.startswith("svd_compensated"):
+                if init_method.startswith("svd_compensated") or init_method == "spectral_grad_compensated":
                     _compensate_weight_(module.in_proj_weight[: module.embed_dim], module.q_A, module.q_B, scaling)
             elif which == "k":
                 module.k_A.copy_(factors["lora_A"].to(module.k_A.device, module.k_A.dtype))
                 module.k_B.copy_(factors["lora_B"].to(module.k_B.device, module.k_B.dtype))
-                if init_method.startswith("svd_compensated"):
+                if init_method.startswith("svd_compensated") or init_method == "spectral_grad_compensated":
                     _compensate_weight_(module.in_proj_weight[module.embed_dim : 2 * module.embed_dim], module.k_A, module.k_B, scaling)
             elif which == "v":
                 module.v_A.copy_(factors["lora_A"].to(module.v_A.device, module.v_A.dtype))
                 module.v_B.copy_(factors["lora_B"].to(module.v_B.device, module.v_B.dtype))
-                if init_method.startswith("svd_compensated"):
+                if init_method.startswith("svd_compensated") or init_method == "spectral_grad_compensated":
                     _compensate_weight_(module.in_proj_weight[2 * module.embed_dim :], module.v_A, module.v_B, scaling)
     print(f"SVD init finished in {time.time() - start:.1f}s", flush=True)
 
@@ -648,13 +788,15 @@ def build_loraplus_param_groups(model, base_lr: float, ratio: float, weight_deca
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", choices=["gs_lora", "lora_official"], required=True)
-    parser.add_argument("--dataset", choices=["sun397", "svhn", "dtd", "eurosat", "stanfordcars"], default="sun397")
+    parser.add_argument("--dataset", choices=["sun397", "svhn", "dtd", "eurosat", "stanfordcars", "resisc45"], default="sun397")
     parser.add_argument("--data-root", default="/workspace/KeepLoRA/MTIL/data/Sun397")
     parser.add_argument("--partition-dir", default="/workspace/KeepLoRA/MTIL/data/Sun397/Partitions")
     parser.add_argument("--train-list", default="Training_01.txt")
     parser.add_argument("--test-list", default="Testing_01.txt")
     parser.add_argument("--svhn-root", default="/workspace/datasets/svhn")
-    parser.add_argument("--svhn-single-digit-only", action="store_true")
+    parser.add_argument("--svhn-format1-root", default="/workspace/datasets/svhn_format1")
+    parser.add_argument("--svhn-street-view", action="store_true",
+                        help="Use street-view SVHN (Format 2) with single-digit filtering")
     parser.add_argument("--dtd-root", default="/workspace/KeepLoRA/MTIL/data/DTD")
     parser.add_argument("--dtd-split-file", default="/workspace/KeepLoRA/MTIL/data/DTD/split_zhou_DescribableTextures.json")
     parser.add_argument("--dtd-train-split", default="train")
@@ -667,6 +809,9 @@ def main():
     parser.add_argument("--stanfordcars-split-file", default="/workspace/KeepLoRA/MTIL/data/StanfordCars/split_zhou_StanfordCars.json")
     parser.add_argument("--stanfordcars-train-split", default="train")
     parser.add_argument("--stanfordcars-test-split", default="test")
+    parser.add_argument("--resisc45-root", default="/workspace/KeepLoRA/MTIL/data/RESISC45/Dataset")
+    parser.add_argument("--resisc45-train-split", default="train")
+    parser.add_argument("--resisc45-test-split", default="test")
     parser.add_argument("--clip-cache-root", default="/root/.cache/clip")
     parser.add_argument("--prompt-template", default=None)
     parser.add_argument("--output-dir", required=True)
@@ -684,10 +829,26 @@ def main():
     parser.add_argument("--r-min", type=int, default=2)
     parser.add_argument("--r-max", type=int, default=16)
     parser.add_argument("--rank-budget-mode", choices=["independent", "param", "independent_capped"], default="param")
+    parser.add_argument("--rank-score-mode", choices=["spectral", "spectral_sensitivity", "spectral_gradnorm"], default="spectral")
     parser.add_argument("--qk-min-rank", type=int, default=None)
     parser.add_argument("--param-budget", type=int, default=None)
     parser.add_argument("--calibration-steps", type=int, default=16)
-    parser.add_argument("--init-method", choices=["svd_sqrt", "svd_a_zero_b", "svd_compensated", "svd_compensated_svd"], default="svd_sqrt")
+    parser.add_argument(
+        "--init-method",
+        choices=[
+            "svd_sqrt",
+            "svd_a_zero_b",
+            "svd_compensated",
+            "svd_compensated_svd",
+            "spectral_grad",
+            "spectral_grad_compensated",
+        ],
+        default="svd_sqrt",
+    )
+    parser.add_argument("--scaling-mode", choices=["rank", "sqrt_rank", "power_rank", "centered_power", "high_rank_boost", "avg_rank"], default="rank")
+    parser.add_argument("--scaling-power", type=float, default=1.0)
+    parser.add_argument("--scaling-base-rank", type=float, default=None)
+    parser.add_argument("--scaling-warmup-ratio", type=float, default=0.0)
     parser.add_argument("--svd-scale", "--init-scale", "--init_scale", dest="svd_scale", type=float, default=0.01)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
@@ -696,6 +857,8 @@ def main():
     args = parser.parse_args()
     if args.prompt_template is None:
         args.prompt_template = "a photo of a {}."
+    if args.scaling_base_rank is None:
+        args.scaling_base_rank = float(args.base_rank)
 
     seed_everything(args.seed)
     output_dir = Path(args.output_dir)
@@ -721,18 +884,27 @@ def main():
         test_dataset = Sun397Dataset(test_samples, preprocess)
         print(f"SUN397: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
     else:
-        if args.dataset == "svhn" and not args.svhn_single_digit_only:
-            raise ValueError("SVHN currently expects --svhn-single-digit-only so labels map cleanly to 0-9.")
         if args.dataset == "svhn":
-            data = load_dataset(args.svhn_root)
             class_names = [str(i) for i in range(10)]
-            train_dataset = SvhnSingleDigitDataset(data["train"], preprocess)
-            test_dataset = SvhnSingleDigitDataset(data["test"], preprocess)
-            if args.max_train_samples is not None:
-                train_dataset.indices = train_dataset.indices[: args.max_train_samples]
-            if args.max_eval_samples is not None:
-                test_dataset.indices = test_dataset.indices[: args.max_eval_samples]
-            print(f"SVHN single digit: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
+            if args.svhn_street_view:
+                data = load_dataset(args.svhn_root)
+                train_dataset = SvhnSingleDigitDataset(data["train"], preprocess)
+                test_dataset = SvhnSingleDigitDataset(data["test"], preprocess)
+                if args.max_train_samples is not None:
+                    train_dataset.indices = train_dataset.indices[:args.max_train_samples]
+                if args.max_eval_samples is not None:
+                    test_dataset.indices = test_dataset.indices[:args.max_eval_samples]
+                print(f"SVHN street-view: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
+            else:
+                train_dataset = SvhnFormat1Dataset(args.svhn_format1_root, "train", preprocess)
+                test_dataset = SvhnFormat1Dataset(args.svhn_format1_root, "test", preprocess)
+                if args.max_train_samples is not None:
+                    train_dataset.dataset.data = train_dataset.dataset.data[:args.max_train_samples]
+                    train_dataset.dataset.labels = train_dataset.dataset.labels[:args.max_train_samples]
+                if args.max_eval_samples is not None:
+                    test_dataset.dataset.data = test_dataset.dataset.data[:args.max_eval_samples]
+                    test_dataset.dataset.labels = test_dataset.dataset.labels[:args.max_eval_samples]
+                print(f"SVHN Format 1: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
         elif args.dataset == "dtd":
             class_names, train_samples, test_samples = build_dtd_split(
                 args.dtd_root,
@@ -761,6 +933,19 @@ def main():
             train_dataset = ImagePathDataset(train_samples, preprocess)
             test_dataset = ImagePathDataset(test_samples, preprocess)
             print(f"EuroSAT: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
+        elif args.dataset == "resisc45":
+            class_names, train_samples, test_samples = build_imagefolder_split(
+                args.resisc45_root,
+                args.resisc45_train_split,
+                args.resisc45_test_split,
+            )
+            if args.max_train_samples is not None:
+                train_samples = train_samples[: args.max_train_samples]
+            if args.max_eval_samples is not None:
+                test_samples = test_samples[: args.max_eval_samples]
+            train_dataset = ImagePathDataset(train_samples, preprocess)
+            test_dataset = ImagePathDataset(test_samples, preprocess)
+            print(f"RESISC45: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
         else:
             class_names, train_samples, test_samples = build_zhou_image_split(
                 args.stanfordcars_root,
@@ -789,7 +974,7 @@ def main():
             uniform[f"visual.transformer.resblocks.{idx}.attn.out_proj"] = args.base_rank
             uniform[f"visual.transformer.resblocks.{idx}.mlp.c_fc"] = args.base_rank
             uniform[f"visual.transformer.resblocks.{idx}.mlp.c_proj"] = args.base_rank
-        model.inject_lora(uniform, args.alpha, args.dropout)
+        model.inject_lora(uniform, args.alpha, args.dropout, args.scaling_mode, args.scaling_power, args.scaling_base_rank)
         model.to(device)
         text_features = build_text_features(model, class_names, args.prompt_template, device).to(device)
         set_base_attention_trainable(model, True)
@@ -823,14 +1008,15 @@ def main():
                     min(args.base_rank, int(values.numel()), args.r_max) * rank_costs[name]
                     for name, values in singular_values.items()
                 )
+            min_rank_overrides = None
+            if args.qk_min_rank is not None:
+                min_rank_overrides = {
+                    name: args.qk_min_rank
+                    for name in singular_values
+                    if name.endswith(".attn.q") or name.endswith(".attn.k")
+                }
+            score_weights = None
             if args.rank_budget_mode == "independent_capped":
-                min_rank_overrides = None
-                if args.qk_min_rank is not None:
-                    min_rank_overrides = {
-                        name: args.qk_min_rank
-                        for name in singular_values
-                        if name.endswith(".attn.q") or name.endswith(".attn.k")
-                    }
                 rank_pattern, target_ranks = allocate_independent_capped(
                     singular_values,
                     rank_costs,
@@ -841,7 +1027,16 @@ def main():
                     min_rank_overrides,
                 )
             else:
-                rank_pattern = allocate_param_budget(singular_values, rank_costs, args.r_min, args.r_max, param_budget)
+                score_weights = build_score_weights(grad_cache, args.rank_score_mode)
+                rank_pattern = allocate_param_budget(
+                    singular_values,
+                    rank_costs,
+                    args.r_min,
+                    args.r_max,
+                    param_budget,
+                    score_weights=score_weights,
+                    min_rank_overrides=min_rank_overrides,
+                )
                 target_ranks = {name: rank_pattern[name] for name in singular_values}
             rank_stats = {}
             for name, values in singular_values.items():
@@ -857,7 +1052,8 @@ def main():
                     "param_count": rank * rank_costs[name],
                     "target_rank": float(target_ranks.get(name, rank)),
                     "budget_target": int(param_budget),
-                    "min_rank": float(min_rank_overrides.get(name, args.r_min)) if args.rank_budget_mode == "independent_capped" and min_rank_overrides is not None else float(args.r_min),
+                    "min_rank": float(min_rank_overrides.get(name, args.r_min)) if min_rank_overrides is not None else float(args.r_min),
+                    "score_weight": float(score_weights.get(name, 1.0)) if args.rank_budget_mode == "param" and score_weights is not None else 1.0,
                 }
         else:
             rank_pattern, rank_stats = allocate_ranks(grad_cache, RankConfig(args.tau, args.r_min, args.r_max, args.base_rank))
@@ -866,10 +1062,10 @@ def main():
         del model
         torch.cuda.empty_cache()
         model = OpenAIClipClassifier(args.clip_cache_root)
-        model.inject_lora(rank_pattern, args.alpha, args.dropout)
+        model.inject_lora(rank_pattern, args.alpha, args.dropout, args.scaling_mode, args.scaling_power, args.scaling_base_rank)
         model.to(device)
         text_features = build_text_features(model, class_names, args.prompt_template, device).to(device)
-        apply_svd_init(model, grad_cache, rank_pattern, args.svd_scale, args.alpha, args.init_method)
+        apply_svd_init(model, grad_cache, rank_pattern, args.svd_scale, args.alpha, args.init_method, args.scaling_mode, args.scaling_power, args.scaling_base_rank)
         model.freeze_backbone()
         with (output_dir / "rank_pattern.json").open("w") as f:
             json.dump(rank_pattern, f, indent=2)
@@ -885,7 +1081,7 @@ def main():
             rank_pattern[f"visual.transformer.resblocks.{idx}.attn.out_proj"] = args.base_rank
             rank_pattern[f"visual.transformer.resblocks.{idx}.mlp.c_fc"] = args.base_rank
             rank_pattern[f"visual.transformer.resblocks.{idx}.mlp.c_proj"] = args.base_rank
-        model.inject_lora(rank_pattern, args.alpha, args.dropout)
+        model.inject_lora(rank_pattern, args.alpha, args.dropout, args.scaling_mode, args.scaling_power, args.scaling_base_rank)
         model.to(device)
         text_features = build_text_features(model, class_names, args.prompt_template, device).to(device)
 
@@ -909,13 +1105,19 @@ def main():
 
     scheduler = LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=False)
+    scaling_warmup_steps = int(total_steps * args.scaling_warmup_ratio)
+    if scaling_warmup_steps > 0:
+        model.set_lora_scaling_progress(0.0)
     metrics = {}
     for epoch in range(1, args.epochs + 1):
         model.train()
         loss_sum = 0.0
         seen = 0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
-        for images, labels in progress:
+        for batch_idx, (images, labels) in enumerate(progress):
+            global_step = (epoch - 1) * len(train_loader) + batch_idx
+            if scaling_warmup_steps > 0:
+                model.set_lora_scaling_progress(min(1.0, global_step / max(1, scaling_warmup_steps)))
             images = images.to(device, non_blocking=True)
             labels = torch.as_tensor(labels, device=device)
             optimizer.zero_grad(set_to_none=True)

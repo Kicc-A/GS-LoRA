@@ -17,10 +17,9 @@ class GSLoraConfig:
     bias: str = "none"
     init_method: str = "none"
     init_scale: float = 1e-3
-    gora_stable_gamma: float = 5e-2
-    gora_scale_by_lr: bool = False
-    gora_lr: float = 5e-2
-    compensate_scaling: bool = True
+    init_energy_beta: float = 0.5
+    init_energy_eps: float = 1e-8
+    init_small_b_scale: float = 1e-4
     scaling_mode: str = "rank"
     rank_budget_mode: str = "independent"
     param_budget: Optional[int] = None

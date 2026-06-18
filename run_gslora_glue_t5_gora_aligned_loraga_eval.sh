@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODEL="${MODEL:-/workspace/Models/T5-Base}"
 GLUE_ROOT="${GLUE_ROOT:-/workspace/datasets/glue}"
-OUT_ROOT="${OUT_ROOT:-outputs/glue_t5_gora_aligned_loraga_eval_scale0.01}"
+OUT_ROOT="${OUT_ROOT:-outputs/glue_t5_gora_aligned_loraga_eval_parambudget_scale0.01_loraplus16}"
 TASKS="${TASKS:-mnli sst2 cola qnli mrpc}"
 SEEDS="${SEEDS:-42}"
 
@@ -30,17 +30,24 @@ for SEED in ${SEEDS}; do
       --max_source_length 128 \
       --max_target_length 32 \
       --generation_max_length 32 \
+      --glue_format loraga \
+      --metric_style loraga_logits \
+      --no_mask_label_padding \
       --target_modules q k v o wi wo \
       --tau 0.90 \
       --r_min 4 \
       --r_max 32 \
       --base_rank 8 \
-      --lora_alpha 32 \
+      --lora_alpha 16 \
       --lora_dropout 0.05 \
       --calibration_steps 64 \
       --init_method svd_a_zero_b \
       --init_scale 0.01 \
-      --scaling_mode rank \
+      --scaling_mode avg_rank \
+      --rank_budget_mode param \
+      --param_budget 3244032 \
+      --use_loraplus \
+      --loraplus_lr_ratio 16 \
       --seed "${SEED}"
   done
 done

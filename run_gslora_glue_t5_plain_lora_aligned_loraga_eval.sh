@@ -30,12 +30,15 @@ for SEED in ${SEEDS}; do
       --max_source_length 128 \
       --max_target_length 32 \
       --generation_max_length 32 \
+      --glue_format loraga \
+      --metric_style loraga_logits \
+      --no_mask_label_padding \
       --target_modules q k v o wi wo \
       --tau 0.90 \
       --r_min 4 \
       --r_max 32 \
       --base_rank 8 \
-      --lora_alpha 32 \
+      --lora_alpha 16 \
       --lora_dropout 0.05 \
       --calibration_steps 64 \
       --init_method svd_a_zero_b \
