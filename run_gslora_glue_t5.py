@@ -85,6 +85,7 @@ def parse_args():
     p.add_argument("--lr_scheduler_type", type=str, default="cosine")
     p.add_argument("--per_device_train_batch_size", type=int, default=32)
     p.add_argument("--per_device_eval_batch_size", type=int, default=32)
+    p.add_argument("--eval_accumulation_steps", type=int, default=None)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--evaluation_strategy", type=str, default="epoch")
     p.add_argument("--save_strategy", type=str, default="epoch")
@@ -534,6 +535,7 @@ def main():
         lr_scheduler_type=args.lr_scheduler_type,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
+        eval_accumulation_steps=args.eval_accumulation_steps,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         save_strategy=args.save_strategy,
         logging_steps=args.logging_steps,
