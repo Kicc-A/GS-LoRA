@@ -114,9 +114,10 @@ def parse_args():
     p.add_argument("--init_method", type=str, default="svd_a_zero_b", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "svd_a_energy_zero_b", "svd_a_energy_small_b"])
     p.add_argument("--rank_budget_mode", type=str, default="independent", choices=["independent", "param"])
     p.add_argument("--param_budget", type=int, default=None)
-    p.add_argument("--rank_score_gamma", type=float, default=1.0)
-    p.add_argument("--attention_rank_prior", type=float, default=1.0)
-    p.add_argument("--init_scale", type=float, default=1.0)
+    p.add_argument("--rank_score_gamma", type=str, default="1.0")
+    p.add_argument("--attention_rank_prior", type=str, default="1.0")
+    p.add_argument("--init_scale", type=str, default="1.0")
+    p.add_argument("--init_auto_target_ratio", type=float, default=0.01)
     p.add_argument("--init_energy_beta", type=float, default=0.5)
     p.add_argument("--init_energy_eps", type=float, default=1e-8)
     p.add_argument("--init_small_b_scale", type=float, default=1e-4)
@@ -317,6 +318,7 @@ def build_model(args, tokenizer, train_dataset):
                 rank_score_gamma=args.rank_score_gamma,
                 attention_rank_prior=args.attention_rank_prior,
                 init_scale=args.init_scale,
+                init_auto_target_ratio=args.init_auto_target_ratio,
                 init_energy_beta=args.init_energy_beta,
                 init_energy_eps=args.init_energy_eps,
                 init_small_b_scale=args.init_small_b_scale,

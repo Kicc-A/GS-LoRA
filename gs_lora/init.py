@@ -12,6 +12,37 @@ SVD_INIT_METHODS = {
 }
 
 
+
+def _is_auto(value) -> bool:
+    return isinstance(value, str) and value.lower() == "auto"
+
+
+def _safe_float(value, default: float) -> float:
+    if _is_auto(value):
+        return default
+    return float(value)
+
+
+def _auto_rescale_factors(factors, item, effective_scaling: float, config):
+    input_rms = float(item.get("input_rms", 0.0) or 0.0)
+    output_rms = float(item.get("output_rms", 0.0) or 0.0)
+    if input_rms <= 0.0 or output_rms <= 0.0:
+        return factors, 1.0
+    lora_a = factors["lora_A"].float()
+    lora_b = factors["lora_B"].float()
+    update = torch.matmul(lora_b, lora_a)
+    update_rms = update.pow(2).mean().sqrt().item() * input_rms * max(float(effective_scaling), 1e-12)
+    if update_rms <= 1e-12:
+        return factors, 1.0
+    target_ratio = max(float(getattr(config, "init_auto_target_ratio", 0.01)), 0.0)
+    target_rms = target_ratio * output_rms
+    product_scale = max(target_rms / update_rms, 1e-12)
+    factor_scale = product_scale ** 0.5
+    return {
+        "lora_A": factors["lora_A"] * factor_scale,
+        "lora_B": factors["lora_B"] * factor_scale,
+    }, product_scale
+
 def _svd_compute_device(source: torch.Tensor) -> torch.device:
     if source.is_cuda:
         return source.device
@@ -100,6 +131,7 @@ def svd_lora_factors(
     else:
         raise ValueError(f"Unknown init_method: {method}")
 
+    init_scale = _safe_float(init_scale, 1.0)
     factor_scale = init_scale / effective_scaling if effective_scaling > 0 else init_scale
     factor_scale = factor_scale ** 0.5
     lora_a = lora_a * factor_scale
@@ -137,16 +169,23 @@ def build_init_state(grad_cache, rank_pattern: Dict[str, int], config):
     for name, item in grad_cache.items():
         rank = int(rank_pattern[name])
         scaling = compute_effective_scaling(rank, avg_rank, config)
+        requested_init_scale = getattr(config, "init_scale", 1.0)
         factors = svd_lora_factors(
             item["grad"],
             rank,
             method=config.init_method,
-            init_scale=config.init_scale,
+            init_scale=1.0 if _is_auto(requested_init_scale) else requested_init_scale,
             effective_scaling=scaling,
             energy_beta=getattr(config, "init_energy_beta", 0.5),
             energy_eps=getattr(config, "init_energy_eps", 1e-8),
             small_b_scale=getattr(config, "init_small_b_scale", 1e-4),
         )
         if factors is not None:
+            if _is_auto(requested_init_scale):
+                factors, product_scale = _auto_rescale_factors(factors, item, scaling, config)
+                factors["auto_init_scale"] = float(product_scale)
+                factors["auto_init_target_ratio"] = float(getattr(config, "init_auto_target_ratio", 0.01))
+                factors["input_rms"] = float(item.get("input_rms", 0.0) or 0.0)
+                factors["output_rms"] = float(item.get("output_rms", 0.0) or 0.0)
             init_state[name] = factors
     return init_state

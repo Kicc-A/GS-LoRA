@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 
 
 @dataclass
@@ -16,12 +16,13 @@ class GSLoraConfig:
     adaptive_rank: bool = True
     bias: str = "none"
     init_method: str = "none"
-    init_scale: float = 1e-3
+    init_scale: Union[float, str] = 1e-3
+    init_auto_target_ratio: float = 0.01
     init_energy_beta: float = 0.5
     init_energy_eps: float = 1e-8
     init_small_b_scale: float = 1e-4
     scaling_mode: str = "rank"
     rank_budget_mode: str = "independent"
     param_budget: Optional[int] = None
-    rank_score_gamma: float = 1.0
-    attention_rank_prior: float = 1.0
+    rank_score_gamma: Union[float, str] = 1.0
+    attention_rank_prior: Union[float, str] = 1.0

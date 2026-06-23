@@ -7,12 +7,12 @@ GPU="${GPU:-0}"
 SEEDS="${SEEDS:-42}"
 TASKS="${TASKS:-mnli qnli}"
 
-ALLOC_GAMMA="${ALLOC_GAMMA:-1.5}"
-ATTN_PRIOR="${ATTN_PRIOR:-1.2}"
+ALLOC_GAMMA="${ALLOC_GAMMA:-auto}"
+ATTN_PRIOR="${ATTN_PRIOR:-auto}"
 
 for SEED in $SEEDS; do
   for TASK in $TASKS; do
-    SCALE=0.9
+    SCALE="${INIT_SCALE:-auto}"
     BETA=0.5
     DROPOUT=0.05
 

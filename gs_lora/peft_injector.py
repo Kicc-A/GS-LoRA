@@ -52,6 +52,9 @@ def apply_svd_init(model, init_state, method="svd_a_zero_b"):
             "peft_name": peft_name,
             "method": method,
         }
+        for key in ("auto_init_scale", "auto_init_target_ratio", "input_rms", "output_rms"):
+            if key in init:
+                applied[original_name][key] = float(init[key])
 
     missing = sorted(set(init_state) - set(applied))
     if missing:

@@ -52,7 +52,8 @@ def parse_args():
     parser.add_argument("--use_lora_plus", action="store_true", help="Use LoRA+ style higher LR for LoRA B weights")
     parser.add_argument("--lora_plus_scaler", type=float, default=16.0, help="LR multiplier for LoRA B weights when LoRA+ is enabled")
     parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "svd_a_energy_zero_b", "svd_a_energy_small_b"], default="svd_a_zero_b")
-    parser.add_argument("--init_scale", type=float, default=1e-3)
+    parser.add_argument("--init_scale", type=str, default="1e-3")
+    parser.add_argument("--init_auto_target_ratio", type=float, default=0.01)
     parser.add_argument("--init_energy_beta", type=float, default=0.5)
     parser.add_argument("--init_energy_eps", type=float, default=1e-8)
     parser.add_argument("--init_small_b_scale", type=float, default=1e-4)
@@ -684,6 +685,7 @@ def main():
         adaptive_rank=not args.skip_adaptive_rank,
         init_method=args.init_method,
         init_scale=args.init_scale,
+        init_auto_target_ratio=args.init_auto_target_ratio,
         init_energy_beta=args.init_energy_beta,
         init_energy_eps=args.init_energy_eps,
         init_small_b_scale=args.init_small_b_scale,

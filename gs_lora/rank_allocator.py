@@ -11,24 +11,101 @@ def _svd_compute_device(source: torch.Tensor) -> torch.device:
     return source.device
 
 
+
+def _is_auto(value) -> bool:
+    return isinstance(value, str) and value.lower() == "auto"
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _safe_float(value, default: float) -> float:
+    if _is_auto(value):
+        return default
+    return float(value)
+
+
+def _energy_concentration(energy: torch.Tensor, total_energy: float) -> float:
+    if total_energy <= 1e-12 or energy.numel() == 0:
+        return 0.0
+    return float((energy[0] / max(float(total_energy), 1e-12)).item())
+
+
+def _base_candidate_score(marginal_energy: float, total_energy: float, rank_cost: int, gamma: float) -> float:
+    if marginal_energy <= 0.0:
+        return 0.0
+    relative_energy = marginal_energy / max(float(total_energy), 1e-12)
+    sharpened_energy = marginal_energy * (relative_energy ** (gamma - 1.0))
+    return sharpened_energy / max(rank_cost, 1)
+
+
+def _resolve_rank_score_gamma(module_items, config) -> float:
+    configured = getattr(config, "rank_score_gamma", 1.0)
+    if not _is_auto(configured):
+        return max(float(configured), 1e-6)
+    concentrations = [
+        _energy_concentration(values["energy"], values["total_energy"])
+        for values in module_items.values()
+        if values["total_energy"] > 1e-12
+    ]
+    if not concentrations:
+        return 1.0
+    mean_concentration = sum(concentrations) / len(concentrations)
+    return 1.0 + _clamp((mean_concentration - 0.15) / 0.35, 0.0, 0.5)
+
+
+def _resolve_attention_rank_prior(module_items, config, gamma: float) -> float:
+    configured = getattr(config, "attention_rank_prior", 1.0)
+    if not _is_auto(configured):
+        return float(configured)
+    attn_scores = []
+    other_scores = []
+    for name, values in module_items.items():
+        total_energy = values["total_energy"]
+        rank_cost = values["rank_cost"]
+        energy = values["energy"]
+        for rank_index in range(values["r_min"], values["r_max"]):
+            marginal_energy = energy[rank_index].item() if rank_index < energy.numel() else 0.0
+            score = _base_candidate_score(marginal_energy, total_energy, rank_cost, gamma)
+            if score <= 0.0:
+                continue
+            if _target_module_leaf(name) in {"q", "k", "v", "o"}:
+                attn_scores.append(score)
+            else:
+                other_scores.append(score)
+    if not attn_scores or not other_scores:
+        return 1.0
+    attn_mean = sum(attn_scores) / len(attn_scores)
+    other_mean = sum(other_scores) / len(other_scores)
+    return _clamp(attn_mean / max(other_mean, 1e-12), 0.8, 1.2)
+
 def _target_module_leaf(name: str) -> str:
     return name.rsplit(".", 1)[-1]
 
 
-def _module_rank_prior(name: str, config) -> float:
+def _module_rank_prior(name: str, config, resolved_attention_prior: float = None) -> float:
     leaf = _target_module_leaf(name)
     if leaf in {"q", "k", "v", "o"}:
-        return float(getattr(config, "attention_rank_prior", 1.0))
+        if resolved_attention_prior is not None:
+            return float(resolved_attention_prior)
+        return _safe_float(getattr(config, "attention_rank_prior", 1.0), 1.0)
     return 1.0
 
 
-def _marginal_rank_score(marginal_energy: float, total_energy: float, rank_cost: int, name: str, config) -> float:
-    if marginal_energy <= 0.0:
-        return 0.0
-    gamma = max(float(getattr(config, "rank_score_gamma", 1.0)), 1e-6)
-    relative_energy = marginal_energy / max(float(total_energy), 1e-12)
-    sharpened_energy = marginal_energy * (relative_energy ** (gamma - 1.0))
-    return _module_rank_prior(name, config) * sharpened_energy / max(rank_cost, 1)
+def _marginal_rank_score(
+    marginal_energy: float,
+    total_energy: float,
+    rank_cost: int,
+    name: str,
+    config,
+    resolved_gamma: float = None,
+    resolved_attention_prior: float = None,
+) -> float:
+    gamma = max(float(resolved_gamma if resolved_gamma is not None else _safe_float(getattr(config, "rank_score_gamma", 1.0), 1.0)), 1e-6)
+    return _module_rank_prior(name, config, resolved_attention_prior) * _base_candidate_score(
+        marginal_energy, total_energy, rank_cost, gamma
+    )
 
 
 def adaptive_rank_from_gradient(
@@ -139,9 +216,26 @@ def allocate_global_param_budget_ranks(
         base_cost += min(config.base_rank, r_max) * rank_cost
         max_cost += r_max * rank_cost
 
-        for rank_index in range(r_min, r_max):
+
+    resolved_gamma = _resolve_rank_score_gamma(module_items, config)
+    resolved_attention_prior = _resolve_attention_rank_prior(module_items, config, resolved_gamma)
+
+    candidates = []
+    for name, values in module_items.items():
+        energy = values["energy"]
+        total_energy = values["total_energy"]
+        rank_cost = values["rank_cost"]
+        for rank_index in range(values["r_min"], values["r_max"]):
             marginal_energy = energy[rank_index].item() if rank_index < energy.numel() else 0.0
-            score = _marginal_rank_score(marginal_energy, total_energy, rank_cost, name, config)
+            score = _marginal_rank_score(
+                marginal_energy,
+                total_energy,
+                rank_cost,
+                name,
+                config,
+                resolved_gamma=resolved_gamma,
+                resolved_attention_prior=resolved_attention_prior,
+            )
             candidates.append((score, marginal_energy, rank_cost, name))
 
     budget = int(config.param_budget) if config.param_budget is not None else base_cost
@@ -175,9 +269,9 @@ def allocate_global_param_budget_ranks(
             "budget_param_count": int(used_cost),
             "budget_target": int(budget),
             "budget_base_rank_param_count": int(base_cost),
-            "rank_score_gamma": float(getattr(config, "rank_score_gamma", 1.0)),
-            "attention_rank_prior": float(getattr(config, "attention_rank_prior", 1.0)),
-            "module_rank_prior": float(_module_rank_prior(name, config)),
+            "rank_score_gamma": float(resolved_gamma),
+            "attention_rank_prior": float(resolved_attention_prior),
+            "module_rank_prior": float(_module_rank_prior(name, config, resolved_attention_prior)),
         }
 
     return rank_pattern, rank_stats
