@@ -136,6 +136,7 @@ post/
 
 # experiment outputs
 outputs/
+outputs_new/
 logs/
 wandb/
 

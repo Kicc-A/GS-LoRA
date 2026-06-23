@@ -23,3 +23,5 @@ class GSLoraConfig:
     scaling_mode: str = "rank"
     rank_budget_mode: str = "independent"
     param_budget: Optional[int] = None
+    rank_score_gamma: float = 1.0
+    attention_rank_prior: float = 1.0

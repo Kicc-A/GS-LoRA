@@ -30,6 +30,17 @@ def parse_args():
     parser.add_argument("--eval_split", type=str, default="test")
     parser.add_argument("--eval_question_column", type=str, default="question")
     parser.add_argument("--eval_answer_column", type=str, default="answer")
+    parser.add_argument("--max_src_len", "--max-src-len", type=int, default=None)
+    parser.add_argument("--prompt_path", "--prompt-path", type=str, default=None)
+    parser.add_argument("--dataset_meta_prompt", "--meta-prompt", type=str, default="")
+    parser.add_argument("--dataset_prefix", "--prefix", type=str, default="Q:")
+    parser.add_argument("--dataset_postfix", "--postfix", type=str, default="A:")
+    parser.add_argument("--no_pad_to_max_length", action="store_true")
+    parser.add_argument("--dataset_preset", choices=["default", "loraga_metamathqa"], default="default")
+    parser.add_argument("--loraga_filter_gsm", action="store_true")
+    parser.add_argument("--loraga_max_tokens", type=int, default=512)
+    parser.add_argument("--loraga_train_max_tokens", type=int, default=1024)
+    parser.add_argument("--loraga_filter_tokenizer_name_or_path", type=str, default=None)
     parser.add_argument("--target_modules", nargs="+", default=["q_proj", "v_proj"])
     parser.add_argument("--target_prefix", type=str, default=None)
     parser.add_argument("--base_rank", type=int, default=8)
@@ -83,14 +94,82 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def format_prompt(question: str) -> str:
-    return f"Question:\n{question.strip()}\n\nAnswer:\n"
+def apply_prompt_config(args):
+    if not args.prompt_path:
+        return
+    with open(args.prompt_path, "r", encoding="utf-8") as f:
+        prompt_info = json.load(f)
+    args.dataset_meta_prompt = prompt_info["meta_prompt"]
+    args.dataset_prefix = prompt_info["prefix"]
+    args.dataset_postfix = prompt_info["postfix"]
+
+
+def apply_dataset_preset(args):
+    if args.dataset_preset != "loraga_metamathqa":
+        return
+    args.dataset_meta_prompt = ""
+    args.dataset_prefix = "Q: "
+    args.dataset_postfix = "\nA: "
+    args.loraga_filter_gsm = True
+    args.max_length = args.loraga_train_max_tokens
+    args.max_src_len = args.loraga_train_max_tokens
+
+
+def normalize_dataset_lengths(args):
+    if args.max_src_len is None:
+        args.max_src_len = args.max_length
+    elif args.max_src_len > args.max_length:
+        args.max_length, args.max_src_len = args.max_src_len, args.max_length
+        if is_main_process():
+            print("--->max_src_len is greater than max_length, swapped to match MyTransformers behavior")
+
+
+def get_effective_lengths(args):
+    return args.max_length, args.max_src_len
+
+
+def encode_text(tokenizer, text: str) -> List[int]:
+    return tokenizer.encode(str(text), add_special_tokens=False)
+
+
+def build_prompt_ids(question: str, tokenizer, args) -> List[int]:
+    input_ids = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
+    input_ids += encode_text(tokenizer, args.dataset_meta_prompt) if args.dataset_meta_prompt else []
+    input_ids += encode_text(tokenizer, args.dataset_prefix) if args.dataset_prefix else []
+    input_ids += encode_text(tokenizer, question)
+    input_ids += encode_text(tokenizer, args.dataset_postfix) if args.dataset_postfix else []
+    return input_ids
+
+
+def format_prompt(question: str, args) -> str:
+    return (
+        f"{args.dataset_meta_prompt or ''}"
+        f"{args.dataset_prefix or ''}"
+        f"{str(question)}"
+        f"{args.dataset_postfix or ''}"
+    )
 
 
 def maybe_select(dataset, max_samples: Optional[int], seed: int):
     if max_samples is not None and max_samples < len(dataset):
         return dataset.shuffle(seed=seed).select(range(max_samples))
     return dataset
+
+
+def preprocess_loraga_metamathqa_example(example, args):
+    result = dict(example)
+    answer = str(result[args.train_answer_column])
+    result[args.train_answer_column] = answer.split("\nThe answer is:")[0]
+    return result
+
+
+def is_loraga_metamathqa_example(example, tokenizer, args) -> bool:
+    if args.loraga_filter_gsm and "GSM" not in str(example.get("type", "")):
+        return False
+    question = str(example[args.train_question_column])
+    answer = str(example[args.train_answer_column]).split("\nThe answer is:")[0]
+    token_count = len(build_prompt_ids(question, tokenizer, args) + encode_text(tokenizer, " " + answer))
+    return token_count < args.loraga_max_tokens
 
 
 def is_main_process() -> bool:
@@ -159,9 +238,16 @@ def setup_distributed(args):
 
 
 def load_split(dataset_name: str, dataset_config: Optional[str], split: str):
+    if os.path.isfile(dataset_name):
+        extension = os.path.splitext(dataset_name)[1].lstrip(".")
+        loader = "json" if extension in {"json", "jsonl"} else extension
+        return load_dataset(loader, data_files={split: dataset_name}, split=split)
     if os.path.isdir(dataset_name):
+        load_dir = dataset_name
+        if dataset_config and os.path.isdir(os.path.join(dataset_name, dataset_config)):
+            load_dir = os.path.join(dataset_name, dataset_config)
         try:
-            dataset = load_from_disk(dataset_name)
+            dataset = load_from_disk(load_dir)
             if isinstance(dataset, DatasetDict):
                 return dataset[split]
             return dataset
@@ -169,12 +255,20 @@ def load_split(dataset_name: str, dataset_config: Optional[str], split: str):
             data_files = {}
             for name in ("train", "validation", "test"):
                 for extension in ("jsonl", "json", "parquet", "csv"):
-                    path = os.path.join(dataset_name, f"{name}.{extension}")
+                    path = os.path.join(load_dir, f"{name}.{extension}")
                     if os.path.exists(path):
                         data_files[name] = path
+                    shard_glob = os.path.join(load_dir, f"{name}-*.{extension}")
+                    import glob
+                    shard_paths = sorted(glob.glob(shard_glob))
+                    if shard_paths:
+                        data_files[name] = shard_paths
             if not data_files:
                 raise
-            extension = os.path.splitext(next(iter(data_files.values())))[1].lstrip(".")
+            first_file = next(iter(data_files.values()))
+            if isinstance(first_file, list):
+                first_file = first_file[0]
+            extension = os.path.splitext(first_file)[1].lstrip(".")
             loader = "json" if extension in {"json", "jsonl"} else extension
             return load_dataset(loader, data_files=data_files, split=split)
     if dataset_config:
@@ -183,30 +277,36 @@ def load_split(dataset_name: str, dataset_config: Optional[str], split: str):
 
 
 def tokenize_sft_example(example, tokenizer, args):
+    if args.dataset_preset == "loraga_metamathqa":
+        example = preprocess_loraga_metamathqa_example(example, args)
     question = str(example[args.train_question_column])
     answer = str(example[args.train_answer_column])
-    prompt = format_prompt(question)
+    max_len, max_src_len = get_effective_lengths(args)
 
-    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    answer_ids = tokenizer(answer, add_special_tokens=False)["input_ids"]
+    prompt_ids = build_prompt_ids(question, tokenizer, args)
+    if len(prompt_ids) > max_src_len:
+        prompt_ids = prompt_ids[:max_src_len]
+
+    if args.dataset_preset == "loraga_metamathqa":
+        answer = " " + answer
+    answer_ids = encode_text(tokenizer, answer)
     if tokenizer.eos_token_id is not None:
         answer_ids = answer_ids + [tokenizer.eos_token_id]
-
-    max_answer_length = min(len(answer_ids), args.max_length)
-    max_prompt_length = max(args.max_length - max_answer_length, 0)
-    if len(prompt_ids) > max_prompt_length:
-        prompt_ids = prompt_ids[-max_prompt_length:] if max_prompt_length > 0 else []
+    answer_ids = answer_ids[: max(max_len - len(prompt_ids), 0)]
 
     input_ids = prompt_ids + answer_ids
     labels = [-100] * len(prompt_ids) + answer_ids
+    attention_mask = [1] * len(input_ids)
 
-    if len(input_ids) > args.max_length:
-        input_ids = input_ids[-args.max_length :]
-        labels = labels[-args.max_length :]
+    if not args.no_pad_to_max_length:
+        pad_length = max_len - len(input_ids)
+        input_ids = input_ids + [tokenizer.pad_token_id] * pad_length
+        labels = labels + [-100] * pad_length
+        attention_mask = attention_mask + [0] * pad_length
 
     return {
         "input_ids": input_ids,
-        "attention_mask": [1] * len(input_ids),
+        "attention_mask": attention_mask,
         "labels": labels,
     }
 
@@ -446,9 +546,21 @@ def evaluate_gsm8k(model, tokenizer, eval_dataset, args, device: torch.device) -
         batch = eval_dataset[start : start + args.per_device_eval_batch_size]
         questions = batch[args.eval_question_column]
         answers = batch[args.eval_answer_column]
-        prompts = [format_prompt(question) for question in questions]
-        inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(device)
-        prompt_lengths = inputs["attention_mask"].sum(dim=1).tolist()
+        prompt_id_lists = [build_prompt_ids(question, tokenizer, args) for question in questions]
+        _, max_src_len = get_effective_lengths(args)
+        prompt_id_lists = [ids[:max_src_len] for ids in prompt_id_lists]
+        max_prompt_len = max(len(ids) for ids in prompt_id_lists)
+        input_ids = []
+        attention_mask = []
+        for ids in prompt_id_lists:
+            pad_length = max_prompt_len - len(ids)
+            input_ids.append(ids + [tokenizer.pad_token_id] * pad_length)
+            attention_mask.append([1] * len(ids) + [0] * pad_length)
+        inputs = {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long, device=device),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long, device=device),
+        }
+        prompt_lengths = [inputs["input_ids"].shape[1]] * len(prompt_id_lists)
 
         generated = model.generate(
             **inputs,
@@ -486,6 +598,9 @@ def evaluate_gsm8k(model, tokenizer, eval_dataset, args, device: torch.device) -
 
 def main():
     args = parse_args()
+    apply_prompt_config(args)
+    apply_dataset_preset(args)
+    normalize_dataset_lengths(args)
     distributed, device = setup_distributed(args)
     set_seed(args.seed)
     if is_main_process():
@@ -502,6 +617,15 @@ def main():
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    filter_tokenizer = tokenizer
+    if args.dataset_preset == "loraga_metamathqa" and args.loraga_filter_tokenizer_name_or_path:
+        filter_tokenizer = AutoTokenizer.from_pretrained(
+            args.loraga_filter_tokenizer_name_or_path,
+            use_fast=True,
+            trust_remote_code=args.trust_remote_code,
+        )
+        if filter_tokenizer.pad_token is None:
+            filter_tokenizer.pad_token = filter_tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
@@ -514,7 +638,15 @@ def main():
 
     train_dataset = load_split(args.train_dataset_name, None, args.train_split)
     eval_dataset = load_split(args.eval_dataset_name, args.eval_dataset_config, args.eval_split)
-    train_dataset = maybe_select(train_dataset, args.max_train_samples, args.seed)
+    if args.dataset_preset == "loraga_metamathqa":
+        train_dataset = train_dataset.filter(
+            lambda example: is_loraga_metamathqa_example(example, filter_tokenizer, args),
+            desc="Filtering LoRA-GA MetaMathQA subset",
+        )
+        if args.max_train_samples is not None and args.max_train_samples < len(train_dataset):
+            train_dataset = train_dataset.select(range(args.max_train_samples))
+    else:
+        train_dataset = maybe_select(train_dataset, args.max_train_samples, args.seed)
     eval_dataset = maybe_select(eval_dataset, args.max_eval_samples, args.seed)
 
     tokenized_train = train_dataset.map(

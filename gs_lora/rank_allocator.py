@@ -11,6 +11,26 @@ def _svd_compute_device(source: torch.Tensor) -> torch.device:
     return source.device
 
 
+def _target_module_leaf(name: str) -> str:
+    return name.rsplit(".", 1)[-1]
+
+
+def _module_rank_prior(name: str, config) -> float:
+    leaf = _target_module_leaf(name)
+    if leaf in {"q", "k", "v", "o"}:
+        return float(getattr(config, "attention_rank_prior", 1.0))
+    return 1.0
+
+
+def _marginal_rank_score(marginal_energy: float, total_energy: float, rank_cost: int, name: str, config) -> float:
+    if marginal_energy <= 0.0:
+        return 0.0
+    gamma = max(float(getattr(config, "rank_score_gamma", 1.0)), 1e-6)
+    relative_energy = marginal_energy / max(float(total_energy), 1e-12)
+    sharpened_energy = marginal_energy * (relative_energy ** (gamma - 1.0))
+    return _module_rank_prior(name, config) * sharpened_energy / max(rank_cost, 1)
+
+
 def adaptive_rank_from_gradient(
     grad_matrix: torch.Tensor,
     tau: float = 0.90,
@@ -121,7 +141,8 @@ def allocate_global_param_budget_ranks(
 
         for rank_index in range(r_min, r_max):
             marginal_energy = energy[rank_index].item() if rank_index < energy.numel() else 0.0
-            candidates.append((marginal_energy / max(rank_cost, 1), marginal_energy, rank_cost, name))
+            score = _marginal_rank_score(marginal_energy, total_energy, rank_cost, name, config)
+            candidates.append((score, marginal_energy, rank_cost, name))
 
     budget = int(config.param_budget) if config.param_budget is not None else base_cost
     budget = max(min_cost, min(budget, max_cost))
@@ -154,6 +175,9 @@ def allocate_global_param_budget_ranks(
             "budget_param_count": int(used_cost),
             "budget_target": int(budget),
             "budget_base_rank_param_count": int(base_cost),
+            "rank_score_gamma": float(getattr(config, "rank_score_gamma", 1.0)),
+            "attention_rank_prior": float(getattr(config, "attention_rank_prior", 1.0)),
+            "module_rank_prior": float(_module_rank_prior(name, config)),
         }
 
     return rank_pattern, rank_stats
