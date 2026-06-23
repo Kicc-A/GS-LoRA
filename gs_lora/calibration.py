@@ -13,8 +13,6 @@ except ImportError:
 
 import time
 
-import torch
-
 from .rank_allocator import allocate_ranks
 from .init import build_init_state
 from .targets import find_target_module_names
@@ -33,33 +31,11 @@ def collect_gradients(model, dataloader, loss_fn, config):
     )
     target_set = set(target_names)
 
-    activation_stats = {
-        name: {"input_sq": 0.0, "output_sq": 0.0, "count": 0}
-        for name in target_names
-        if name in target_set
-    }
-    hooks = []
-
-    def make_hook(name):
-        def hook(module, inputs, output):
-            if not inputs:
-                return
-            x = inputs[0]
-            y = output[0] if isinstance(output, (tuple, list)) else output
-            if not torch.is_tensor(x) or not torch.is_tensor(y):
-                return
-            stats = activation_stats[name]
-            stats["input_sq"] += float(x.detach().float().pow(2).mean().cpu())
-            stats["output_sq"] += float(y.detach().float().pow(2).mean().cpu())
-            stats["count"] += 1
-        return hook
-
     for param in model.parameters():
         param.requires_grad = False
     for name, module in model.named_modules():
         if name in target_set:
             module.weight.requires_grad = True
-            hooks.append(module.register_forward_hook(make_hook(name)))
 
     model.train()
     clear_gradients(model)
@@ -72,9 +48,6 @@ def collect_gradients(model, dataloader, loss_fn, config):
         (loss / config.calibration_steps).backward()
         progress.update(1)
     progress.close()
-    for handle in hooks:
-        handle.remove()
-
     grad_cache = {}
     for name, module in model.named_modules():
         if name not in target_set:
@@ -82,12 +55,8 @@ def collect_gradients(model, dataloader, loss_fn, config):
         grad = getattr(module.weight, "grad", None)
         if grad is None:
             continue
-        stats = activation_stats.get(name, {})
-        count = max(int(stats.get("count", 0)), 1)
         grad_cache[name] = {
             "grad": grad.detach().float().cpu(),
-            "input_rms": (float(stats.get("input_sq", 0.0)) / count) ** 0.5,
-            "output_rms": (float(stats.get("output_sq", 0.0)) / count) ** 0.5,
         }
 
     clear_gradients(model)

@@ -54,6 +54,8 @@ def parse_args():
     parser.add_argument("--init_method", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "svd_a_energy_zero_b", "svd_a_energy_small_b"], default="svd_a_zero_b")
     parser.add_argument("--init_scale", type=str, default="1e-3")
     parser.add_argument("--init_auto_target_ratio", type=float, default=0.01)
+    parser.add_argument("--init_auto_scale_min", type=float, default=0.3)
+    parser.add_argument("--init_auto_scale_max", type=float, default=1.2)
     parser.add_argument("--init_energy_beta", type=float, default=0.5)
     parser.add_argument("--init_energy_eps", type=float, default=1e-8)
     parser.add_argument("--init_small_b_scale", type=float, default=1e-4)
@@ -686,6 +688,8 @@ def main():
         init_method=args.init_method,
         init_scale=args.init_scale,
         init_auto_target_ratio=args.init_auto_target_ratio,
+        init_auto_scale_min=args.init_auto_scale_min,
+        init_auto_scale_max=args.init_auto_scale_max,
         init_energy_beta=args.init_energy_beta,
         init_energy_eps=args.init_energy_eps,
         init_small_b_scale=args.init_small_b_scale,

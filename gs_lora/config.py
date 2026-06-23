@@ -18,6 +18,8 @@ class GSLoraConfig:
     init_method: str = "none"
     init_scale: Union[float, str] = 1e-3
     init_auto_target_ratio: float = 0.01
+    init_auto_scale_min: float = 0.3
+    init_auto_scale_max: float = 1.2
     init_energy_beta: float = 0.5
     init_energy_eps: float = 1e-8
     init_small_b_scale: float = 1e-4

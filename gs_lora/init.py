@@ -23,25 +23,27 @@ def _safe_float(value, default: float) -> float:
     return float(value)
 
 
-def _auto_rescale_factors(factors, item, effective_scaling: float, config):
-    input_rms = float(item.get("input_rms", 0.0) or 0.0)
-    output_rms = float(item.get("output_rms", 0.0) or 0.0)
-    if input_rms <= 0.0 or output_rms <= 0.0:
-        return factors, 1.0
-    lora_a = factors["lora_A"].float()
-    lora_b = factors["lora_B"].float()
-    update = torch.matmul(lora_b, lora_a)
-    update_rms = update.pow(2).mean().sqrt().item() * input_rms * max(float(effective_scaling), 1e-12)
-    if update_rms <= 1e-12:
-        return factors, 1.0
-    target_ratio = max(float(getattr(config, "init_auto_target_ratio", 0.01)), 0.0)
-    target_rms = target_ratio * output_rms
-    product_scale = max(target_rms / update_rms, 1e-12)
-    factor_scale = product_scale ** 0.5
-    return {
-        "lora_A": factors["lora_A"] * factor_scale,
-        "lora_B": factors["lora_B"] * factor_scale,
-    }, product_scale
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _auto_init_scale_from_gradient(grad, config) -> float:
+    grad_matrix = grad.detach().float()
+    if grad_matrix.ndim > 2:
+        grad_matrix = grad_matrix.reshape(grad_matrix.shape[0], -1)
+    grad_matrix = grad_matrix.to(_svd_compute_device(grad_matrix), non_blocking=True)
+    singular_values = torch.linalg.svdvals(grad_matrix)
+    energy = singular_values.pow(2)
+    total = float(energy.sum().item())
+    if total <= 1e-12 or energy.numel() == 0:
+        return float(getattr(config, "init_auto_scale_min", 0.3))
+    top_ratio = float((energy[0] / total).item())
+    low = float(getattr(config, "init_auto_scale_min", 0.3))
+    high = float(getattr(config, "init_auto_scale_max", 1.2))
+    # Map spectral concentration into the same scale range used by the sweeps,
+    # without using task labels or validation feedback.
+    weight = _clamp((top_ratio - 0.10) / 0.40, 0.0, 1.0)
+    return low + (high - low) * weight
 
 def _svd_compute_device(source: torch.Tensor) -> torch.device:
     if source.is_cuda:
@@ -170,11 +172,16 @@ def build_init_state(grad_cache, rank_pattern: Dict[str, int], config):
         rank = int(rank_pattern[name])
         scaling = compute_effective_scaling(rank, avg_rank, config)
         requested_init_scale = getattr(config, "init_scale", 1.0)
+        resolved_init_scale = (
+            _auto_init_scale_from_gradient(item["grad"], config)
+            if _is_auto(requested_init_scale)
+            else requested_init_scale
+        )
         factors = svd_lora_factors(
             item["grad"],
             rank,
             method=config.init_method,
-            init_scale=1.0 if _is_auto(requested_init_scale) else requested_init_scale,
+            init_scale=resolved_init_scale,
             effective_scaling=scaling,
             energy_beta=getattr(config, "init_energy_beta", 0.5),
             energy_eps=getattr(config, "init_energy_eps", 1e-8),
@@ -182,10 +189,6 @@ def build_init_state(grad_cache, rank_pattern: Dict[str, int], config):
         )
         if factors is not None:
             if _is_auto(requested_init_scale):
-                factors, product_scale = _auto_rescale_factors(factors, item, scaling, config)
-                factors["auto_init_scale"] = float(product_scale)
-                factors["auto_init_target_ratio"] = float(getattr(config, "init_auto_target_ratio", 0.01))
-                factors["input_rms"] = float(item.get("input_rms", 0.0) or 0.0)
-                factors["output_rms"] = float(item.get("output_rms", 0.0) or 0.0)
+                factors["auto_init_scale"] = float(resolved_init_scale)
             init_state[name] = factors
     return init_state

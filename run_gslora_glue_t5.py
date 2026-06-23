@@ -118,6 +118,8 @@ def parse_args():
     p.add_argument("--attention_rank_prior", type=str, default="1.0")
     p.add_argument("--init_scale", type=str, default="1.0")
     p.add_argument("--init_auto_target_ratio", type=float, default=0.01)
+    p.add_argument("--init_auto_scale_min", type=float, default=0.3)
+    p.add_argument("--init_auto_scale_max", type=float, default=1.2)
     p.add_argument("--init_energy_beta", type=float, default=0.5)
     p.add_argument("--init_energy_eps", type=float, default=1e-8)
     p.add_argument("--init_small_b_scale", type=float, default=1e-4)
@@ -319,6 +321,8 @@ def build_model(args, tokenizer, train_dataset):
                 attention_rank_prior=args.attention_rank_prior,
                 init_scale=args.init_scale,
                 init_auto_target_ratio=args.init_auto_target_ratio,
+                init_auto_scale_min=args.init_auto_scale_min,
+                init_auto_scale_max=args.init_auto_scale_max,
                 init_energy_beta=args.init_energy_beta,
                 init_energy_eps=args.init_energy_eps,
                 init_small_b_scale=args.init_small_b_scale,
