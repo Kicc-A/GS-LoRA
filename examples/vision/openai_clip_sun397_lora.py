@@ -130,9 +130,18 @@ def rank_scaling(alpha, rank, scaling_mode="rank", avg_rank=None, scaling_power=
         boost = max(1.0, (float(rank) / base) ** float(scaling_power))
         return (alpha / rank) * boost
     if scaling_mode == "avg_rank":
-        denom = float(avg_rank) if avg_rank is not None and avg_rank > 0 else float(rank)
+        avg = float(avg_rank) if avg_rank is not None and avg_rank > 0 else float(rank)
+        denom = (float(rank) * avg) ** 0.5
         return alpha / denom
     return alpha / rank
+
+
+def energy_weights(singular_values, beta=0.5, eps=1e-8):
+    energy = singular_values.pow(2)
+    prob = energy / (energy.sum() + eps)
+    weights = (prob + eps).pow(beta)
+    weights = weights / (weights.pow(2).mean().sqrt() + eps)
+    return weights
 
 
 def allocate_independent_capped(singular_values, rank_costs, tau, r_min, r_max, param_budget, min_rank_overrides=None):
@@ -173,7 +182,18 @@ def allocate_independent_capped(singular_values, rank_costs, tau, r_min, r_max, 
     return ranks, target_ranks
 
 
-def svd_lora_factors(grad, weight, rank, init_scale, effective_scaling, init_method="svd_sqrt", eps=1e-12):
+def svd_lora_factors(
+    grad,
+    weight,
+    rank,
+    init_scale,
+    effective_scaling,
+    init_method="svd_sqrt",
+    eps=1e-12,
+    energy_beta=0.5,
+    energy_eps=1e-8,
+    small_b_scale=1e-4,
+):
     grad_matrix = grad.detach().float().reshape(grad.shape[0], -1)
     u, singular_values, vh = torch.linalg.svd(grad_matrix, full_matrices=False)
     rank = min(int(rank), singular_values.numel())
@@ -186,6 +206,19 @@ def svd_lora_factors(grad, weight, rank, init_scale, effective_scaling, init_met
         return {
             "lora_A": (vh * init_scale).cpu(),
             "lora_B": torch.zeros(grad_matrix.shape[0], rank, dtype=vh.dtype).cpu(),
+        }
+    if init_method in ("svd_a_energy_zero_b", "svd_a_energy_small_b"):
+        weights = energy_weights(singular_values, beta=energy_beta, eps=energy_eps)
+        factor_scale = init_scale / effective_scaling if effective_scaling > 0 else init_scale
+        factor_scale = factor_scale ** 0.5
+        lora_a = weights.unsqueeze(1) * vh * factor_scale
+        if init_method == "svd_a_energy_zero_b":
+            lora_b = torch.zeros(grad_matrix.shape[0], rank, dtype=vh.dtype, device=vh.device)
+        else:
+            lora_b = -u * weights.unsqueeze(0) * factor_scale * small_b_scale
+        return {
+            "lora_A": lora_a.cpu(),
+            "lora_B": lora_b.cpu(),
         }
     kept_grad_norm = singular_values.norm().item()
     if kept_grad_norm <= eps or init_scale == 0:
@@ -417,6 +450,28 @@ def format_class_name(name):
     if len(parts) > 1:
         name = "/".join(parts[1:])
     return name.replace("_", " ").replace("-", " ").replace("/", " ")
+
+
+def build_train_preprocess(name, eval_preprocess):
+    if name == "clip":
+        return eval_preprocess
+    if name != "random_resized_crop":
+        raise ValueError(f"Unknown train transform: {name}")
+    from torchvision import transforms
+    try:
+        interpolation = transforms.InterpolationMode.BICUBIC
+    except AttributeError:
+        interpolation = Image.BICUBIC
+    return transforms.Compose([
+        transforms.RandomResizedCrop(224, scale=(0.08, 1.0), interpolation=interpolation),
+        transforms.RandomHorizontalFlip(),
+        transforms.Lambda(lambda image: image.convert("RGB")),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.48145466, 0.4578275, 0.40821073),
+            std=(0.26862954, 0.26130258, 0.27577711),
+        ),
+    ])
 
 
 class LoRALinear(nn.Module):
@@ -671,7 +726,20 @@ def _compensate_weight_(weight, lora_a, lora_b, scaling):
     weight.sub_(delta)
 
 
-def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_method, scaling_mode="rank", scaling_power=1.0, scaling_base_rank=8.0):
+def apply_svd_init(
+    model,
+    grad_cache,
+    rank_pattern,
+    init_scale,
+    alpha,
+    init_method,
+    scaling_mode="rank",
+    scaling_power=1.0,
+    scaling_base_rank=8.0,
+    init_energy_beta=0.5,
+    init_energy_eps=1e-8,
+    init_small_b_scale=1e-4,
+):
     active_ranks = [int(rank) for rank in rank_pattern.values() if int(rank) > 0]
     avg_rank = sum(active_ranks) / len(active_ranks) if active_ranks else None
     modules = {}
@@ -689,7 +757,17 @@ def apply_svd_init(model, grad_cache, rank_pattern, init_scale, alpha, init_meth
         elif init_method in ("svd_compensated_svd", "spectral_grad", "spectral_grad_compensated"):
             factors = compensated_svd_direction_factors(item["grad"], item["weight"], rank, init_scale, scaling)
         else:
-            factors = svd_lora_factors(item["grad"], item["weight"], rank, init_scale, scaling, init_method)
+            factors = svd_lora_factors(
+                item["grad"],
+                item["weight"],
+                rank,
+                init_scale,
+                scaling,
+                init_method,
+                energy_beta=init_energy_beta,
+                energy_eps=init_energy_eps,
+                small_b_scale=init_small_b_scale,
+            )
         if factors is None:
             continue
         module = modules.get(name)
@@ -814,12 +892,17 @@ def main():
     parser.add_argument("--resisc45-test-split", default="test")
     parser.add_argument("--clip-cache-root", default="/root/.cache/clip")
     parser.add_argument("--prompt-template", default=None)
+    parser.add_argument("--train-transform", choices=["clip", "random_resized_crop"], default="clip")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=64)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--loraplus-lr-ratio", type=float, default=16.0)
+    parser.add_argument("--optimizer", choices=["adam", "adamw"], default="adamw")
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--base-rank", type=int, default=8)
@@ -838,6 +921,8 @@ def main():
         choices=[
             "svd_sqrt",
             "svd_a_zero_b",
+            "svd_a_energy_zero_b",
+            "svd_a_energy_small_b",
             "svd_compensated",
             "svd_compensated_svd",
             "spectral_grad",
@@ -850,6 +935,9 @@ def main():
     parser.add_argument("--scaling-base-rank", type=float, default=None)
     parser.add_argument("--scaling-warmup-ratio", type=float, default=0.0)
     parser.add_argument("--svd-scale", "--init-scale", "--init_scale", dest="svd_scale", type=float, default=0.01)
+    parser.add_argument("--init-energy-beta", "--init_energy_beta", dest="init_energy_beta", type=float, default=0.5)
+    parser.add_argument("--init-energy-eps", "--init_energy_eps", dest="init_energy_eps", type=float, default=1e-8)
+    parser.add_argument("--init-small-b-scale", "--init_small_b_scale", dest="init_small_b_scale", type=float, default=1e-4)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
     parser.add_argument("--workers", type=int, default=4)
@@ -870,6 +958,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = OpenAIClipClassifier(args.clip_cache_root)
     preprocess = model.preprocess
+    train_preprocess = build_train_preprocess(args.train_transform, preprocess)
 
     if args.dataset == "sun397":
         root = Path(args.data_root)
@@ -880,7 +969,7 @@ def main():
             train_samples = train_samples[: args.max_train_samples]
         if args.max_eval_samples is not None:
             test_samples = test_samples[: args.max_eval_samples]
-        train_dataset = Sun397Dataset(train_samples, preprocess)
+        train_dataset = Sun397Dataset(train_samples, train_preprocess)
         test_dataset = Sun397Dataset(test_samples, preprocess)
         print(f"SUN397: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
     else:
@@ -888,7 +977,7 @@ def main():
             class_names = [str(i) for i in range(10)]
             if args.svhn_street_view:
                 data = load_dataset(args.svhn_root)
-                train_dataset = SvhnSingleDigitDataset(data["train"], preprocess)
+                train_dataset = SvhnSingleDigitDataset(data["train"], train_preprocess)
                 test_dataset = SvhnSingleDigitDataset(data["test"], preprocess)
                 if args.max_train_samples is not None:
                     train_dataset.indices = train_dataset.indices[:args.max_train_samples]
@@ -896,7 +985,7 @@ def main():
                     test_dataset.indices = test_dataset.indices[:args.max_eval_samples]
                 print(f"SVHN street-view: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
             else:
-                train_dataset = SvhnFormat1Dataset(args.svhn_format1_root, "train", preprocess)
+                train_dataset = SvhnFormat1Dataset(args.svhn_format1_root, "train", train_preprocess)
                 test_dataset = SvhnFormat1Dataset(args.svhn_format1_root, "test", preprocess)
                 if args.max_train_samples is not None:
                     train_dataset.dataset.data = train_dataset.dataset.data[:args.max_train_samples]
@@ -916,7 +1005,7 @@ def main():
                 train_samples = train_samples[: args.max_train_samples]
             if args.max_eval_samples is not None:
                 test_samples = test_samples[: args.max_eval_samples]
-            train_dataset = ImagePathDataset(train_samples, preprocess)
+            train_dataset = ImagePathDataset(train_samples, train_preprocess)
             test_dataset = ImagePathDataset(test_samples, preprocess)
             print(f"DTD: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
         elif args.dataset == "eurosat":
@@ -930,7 +1019,7 @@ def main():
                 train_samples = train_samples[: args.max_train_samples]
             if args.max_eval_samples is not None:
                 test_samples = test_samples[: args.max_eval_samples]
-            train_dataset = ImagePathDataset(train_samples, preprocess)
+            train_dataset = ImagePathDataset(train_samples, train_preprocess)
             test_dataset = ImagePathDataset(test_samples, preprocess)
             print(f"EuroSAT: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
         elif args.dataset == "resisc45":
@@ -943,7 +1032,7 @@ def main():
                 train_samples = train_samples[: args.max_train_samples]
             if args.max_eval_samples is not None:
                 test_samples = test_samples[: args.max_eval_samples]
-            train_dataset = ImagePathDataset(train_samples, preprocess)
+            train_dataset = ImagePathDataset(train_samples, train_preprocess)
             test_dataset = ImagePathDataset(test_samples, preprocess)
             print(f"RESISC45: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
         else:
@@ -957,7 +1046,7 @@ def main():
                 train_samples = train_samples[: args.max_train_samples]
             if args.max_eval_samples is not None:
                 test_samples = test_samples[: args.max_eval_samples]
-            train_dataset = ImagePathDataset(train_samples, preprocess)
+            train_dataset = ImagePathDataset(train_samples, train_preprocess)
             test_dataset = ImagePathDataset(test_samples, preprocess)
             print(f"StanfordCars: {len(class_names)} classes, {len(train_dataset)} train, {len(test_dataset)} test")
 
@@ -1065,7 +1154,20 @@ def main():
         model.inject_lora(rank_pattern, args.alpha, args.dropout, args.scaling_mode, args.scaling_power, args.scaling_base_rank)
         model.to(device)
         text_features = build_text_features(model, class_names, args.prompt_template, device).to(device)
-        apply_svd_init(model, grad_cache, rank_pattern, args.svd_scale, args.alpha, args.init_method, args.scaling_mode, args.scaling_power, args.scaling_base_rank)
+        apply_svd_init(
+            model,
+            grad_cache,
+            rank_pattern,
+            args.svd_scale,
+            args.alpha,
+            args.init_method,
+            args.scaling_mode,
+            args.scaling_power,
+            args.scaling_base_rank,
+            args.init_energy_beta,
+            args.init_energy_eps,
+            args.init_small_b_scale,
+        )
         model.freeze_backbone()
         with (output_dir / "rank_pattern.json").open("w") as f:
             json.dump(rank_pattern, f, indent=2)
@@ -1089,12 +1191,15 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     print(f"trainable params: {trainable:,} || all params: {total:,} || trainable%: {100 * trainable / total:.4f}")
 
-    optimizer = torch.optim.AdamW(
+    optimizer_cls = torch.optim.Adam if args.optimizer == "adam" else torch.optim.AdamW
+    optimizer = optimizer_cls(
         build_loraplus_param_groups(model, args.lr, args.loraplus_lr_ratio, args.weight_decay),
         lr=args.lr,
+        betas=(args.beta1, args.beta2),
         weight_decay=args.weight_decay,
     )
-    total_steps = max(1, args.epochs * len(train_loader))
+    optimizer_steps_per_epoch = (len(train_loader) + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps
+    total_steps = max(1, args.epochs * optimizer_steps_per_epoch)
     warmup_steps = int(total_steps * args.warmup_ratio)
 
     def lr_lambda(step):
@@ -1120,13 +1225,17 @@ def main():
                 model.set_lora_scaling_progress(min(1.0, global_step / max(1, scaling_warmup_steps)))
             images = images.to(device, non_blocking=True)
             labels = torch.as_tensor(labels, device=device)
-            optimizer.zero_grad(set_to_none=True)
+            if batch_idx % args.gradient_accumulation_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 loss, _ = clip_loss(model, images, labels, text_features)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            loss_for_backward = loss / args.gradient_accumulation_steps
+            scaler.scale(loss_for_backward).backward()
+            should_step = ((batch_idx + 1) % args.gradient_accumulation_steps == 0) or ((batch_idx + 1) == len(train_loader))
+            if should_step:
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
             loss_sum += loss.item() * labels.numel()
             seen += labels.numel()
             progress.set_postfix(

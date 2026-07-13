@@ -111,12 +111,18 @@ def parse_args():
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--calibration_steps", type=int, default=64)
+    p.add_argument("--calibration_blocks", type=int, default=1)
+    p.add_argument("--use_stable_budget_score", action="store_true")
+    p.add_argument("--stable_score_min", type=float, default=0.5)
+    p.add_argument("--stable_score_max", type=float, default=1.5)
+    p.add_argument("--stable_budget_stage1_rank", type=int, default=None)
     p.add_argument("--init_method", type=str, default="svd_a_zero_b", choices=["none", "svd_sqrt", "svd_sigma", "svd_a_zero_b", "svd_a_energy_zero_b", "svd_a_energy_small_b"])
     p.add_argument("--rank_budget_mode", type=str, default="independent", choices=["independent", "param"])
     p.add_argument("--param_budget", type=int, default=None)
     p.add_argument("--rank_score_gamma", type=str, default="1.0")
     p.add_argument("--attention_rank_prior", type=str, default="1.0")
     p.add_argument("--init_scale", type=str, default="1.0")
+    p.add_argument("--init_a_rms", type=float, default=0.0)
     p.add_argument("--init_auto_target_ratio", type=float, default=0.01)
     p.add_argument("--init_auto_scale_min", type=float, default=0.3)
     p.add_argument("--init_auto_scale_max", type=float, default=1.2)
@@ -312,6 +318,11 @@ def build_model(args, tokenizer, train_dataset):
                 lora_alpha=args.lora_alpha,
                 lora_dropout=args.lora_dropout,
                 calibration_steps=args.calibration_steps,
+                calibration_blocks=args.calibration_blocks,
+                use_stable_budget_score=args.use_stable_budget_score,
+                stable_score_min=args.stable_score_min,
+                stable_score_max=args.stable_score_max,
+                stable_budget_stage1_rank=args.stable_budget_stage1_rank,
                 adaptive_rank=(not args.skip_adaptive_rank),
                 bias="none",
                 init_method=args.init_method,
@@ -320,6 +331,7 @@ def build_model(args, tokenizer, train_dataset):
                 rank_score_gamma=args.rank_score_gamma,
                 attention_rank_prior=args.attention_rank_prior,
                 init_scale=args.init_scale,
+                init_a_rms=args.init_a_rms,
                 init_auto_target_ratio=args.init_auto_target_ratio,
                 init_auto_scale_min=args.init_auto_scale_min,
                 init_auto_scale_max=args.init_auto_scale_max,
@@ -348,8 +360,10 @@ def build_model(args, tokenizer, train_dataset):
             rank_summary = report.get("rank_summary", None)
             mode = "gslora"
             print("[DEBUG] GS-LoRA successfully prepared.")
-            print("[DEBUG] report =", report)
+            print("[DEBUG] rank_report =", report.get("rank_report"))
             print("[DEBUG] rank_summary =", rank_summary)
+            print("[DEBUG] init_modules =", len(report.get("init_modules", [])))
+            print("[DEBUG] trainable_params =", report.get("params"))
             return model, rank_summary, mode
         except Exception as e:
             print("[ERROR] GS-LoRA prepare failed:", repr(e))
@@ -520,6 +534,7 @@ def main():
     print("[DEBUG] loraplus_lr_ratio =", args.loraplus_lr_ratio)
     print("[DEBUG] init_method =", args.init_method)
     print("[DEBUG] init_scale =", args.init_scale)
+    print("[DEBUG] init_a_rms =", args.init_a_rms)
     print("[DEBUG] rank_budget_mode =", args.rank_budget_mode)
     print("[DEBUG] param_budget =", args.param_budget)
     avg_rank = (rank_summary or {}).get("avg_rank") if isinstance(rank_summary, dict) else None

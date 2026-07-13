@@ -47,6 +47,8 @@ def parse_args():
     parser.add_argument("--tau", type=float, default=0.90)
     parser.add_argument("--r_min", type=int, default=2)
     parser.add_argument("--r_max", type=int, default=16)
+    parser.add_argument("--rank_budget_mode", choices=["independent", "param"], default="independent")
+    parser.add_argument("--param_budget", type=int, default=None)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--use_lora_plus", action="store_true", help="Use LoRA+ style higher LR for LoRA B weights")
@@ -61,6 +63,11 @@ def parse_args():
     parser.add_argument("--init_small_b_scale", type=float, default=1e-4)
     parser.add_argument("--scaling_mode", choices=["rank", "sqrt_rank", "avg_rank"], default="rank")
     parser.add_argument("--calibration_steps", type=int, default=8)
+    parser.add_argument("--calibration_blocks", type=int, default=1)
+    parser.add_argument("--use_stable_budget_score", action="store_true")
+    parser.add_argument("--stable_score_min", type=float, default=0.5)
+    parser.add_argument("--stable_score_max", type=float, default=1.5)
+    parser.add_argument("--stable_budget_stage1_rank", type=int, default=None)
     parser.add_argument("--skip_adaptive_rank", action="store_true")
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--max_new_tokens", type=int, default=256)
@@ -681,9 +688,16 @@ def main():
         tau=args.tau,
         r_min=args.r_min,
         r_max=args.r_max,
+        rank_budget_mode=args.rank_budget_mode,
+        param_budget=args.param_budget,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         calibration_steps=args.calibration_steps,
+        calibration_blocks=args.calibration_blocks,
+        use_stable_budget_score=args.use_stable_budget_score,
+        stable_score_min=args.stable_score_min,
+        stable_score_max=args.stable_score_max,
+        stable_budget_stage1_rank=args.stable_budget_stage1_rank,
         adaptive_rank=not args.skip_adaptive_rank,
         init_method=args.init_method,
         init_scale=args.init_scale,

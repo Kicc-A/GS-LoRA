@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--vllm_dtype", type=str, default="bfloat16")
     parser.add_argument("--vllm_max_lora_rank", type=int, default=32)
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
+    parser.add_argument("--vllm_max_model_len", type=int, default=2048)
     parser.add_argument("--run_config", type=str, default=None)
     parser.add_argument("--model_name_or_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
@@ -207,6 +208,7 @@ def evaluate_gsm8k_vllm(eval_dataset, args, adapter_path):
         enable_lora=True,
         max_lora_rank=args.vllm_max_lora_rank,
         gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        max_model_len=args.vllm_max_model_len,
         trust_remote_code=args.trust_remote_code,
     )
     sampling_params = SamplingParams(
@@ -264,6 +266,7 @@ def main():
     args.vllm_dtype = cli_args.vllm_dtype
     args.vllm_max_lora_rank = cli_args.vllm_max_lora_rank
     args.vllm_gpu_memory_utilization = cli_args.vllm_gpu_memory_utilization
+    args.vllm_max_model_len = cli_args.vllm_max_model_len
     set_seed(args.eval_seed)
 
     eval_dataset = load_split(args.eval_dataset_name, args.eval_dataset_config, args.eval_split)

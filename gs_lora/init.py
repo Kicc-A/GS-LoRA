@@ -74,6 +74,7 @@ def svd_lora_factors(
     energy_beta: float = 0.5,
     energy_eps: float = 1e-8,
     small_b_scale: float = 1e-4,
+    init_a_rms: float = 0.0,
 ):
     if method == "none":
         return None
@@ -141,6 +142,11 @@ def svd_lora_factors(
         lora_b = lora_b * factor_scale
     elif method == "svd_a_energy_small_b":
         lora_b = lora_b * factor_scale * small_b_scale
+
+    target_a_rms = float(init_a_rms or 0.0)
+    if target_a_rms > 0.0:
+        current_a_rms = lora_a.pow(2).mean().sqrt().clamp_min(1e-12)
+        lora_a = lora_a * (target_a_rms / current_a_rms)
     return {
         "lora_A": lora_a.cpu(),
         "lora_B": lora_b.cpu(),
@@ -186,6 +192,7 @@ def build_init_state(grad_cache, rank_pattern: Dict[str, int], config):
             energy_beta=getattr(config, "init_energy_beta", 0.5),
             energy_eps=getattr(config, "init_energy_eps", 1e-8),
             small_b_scale=getattr(config, "init_small_b_scale", 1e-4),
+            init_a_rms=getattr(config, "init_a_rms", 0.0),
         )
         if factors is not None:
             if _is_auto(requested_init_scale):

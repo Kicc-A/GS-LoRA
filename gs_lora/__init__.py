@@ -60,6 +60,7 @@ def prepare_gslora_model(model, dataloader, loss_fn, config: GSLoraConfig, devic
         "target_names": target_names,
         "rank_pattern": rank_pattern,
         "rank_stats": rank_stats,
+        "rank_report": rank_stats.get("__summary__") if isinstance(rank_stats, dict) else None,
         "rank_summary": summarize_ranks(rank_pattern),
         "init_modules": sorted(init_state),
         "svd_init_modules": sorted(init_state) if config.init_method.startswith("svd_") else [],
