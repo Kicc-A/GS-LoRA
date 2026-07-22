@@ -2,21 +2,22 @@
 set -euo pipefail
 
 ROOT=/workspace/GS-LoRA
-EXP_DIR="$ROOT/experiments/llama31_metamathqa_gslora_gpu2"
-OUTPUT_DIR="$EXP_DIR/output"
-SEED="${SEED:-42}"
+SEED=${SEED:-42}
+EXP_NAME=${EXP_NAME:-llama31_metamathqa_gslora_sqrtrank_gpu0123}
+WANDB_NAME=${WANDB_NAME:-gslora-llama31-metamathqa-sqrtrank-gpu0123-seed${SEED}}
+EXP=$ROOT/experiments/$EXP_NAME
+LOG=$EXP/logs/train.log
 
-export PATH="/root/anaconda3/envs/gslora/bin:$PATH"
-export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
-export CUDA_VISIBLE_DEVICES=2
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-mkdir -p "$OUTPUT_DIR" "$EXP_DIR/logs" "$ROOT/wandb"
+mkdir -p "$EXP/logs"
 cd "$ROOT"
 
-exec python -u examples/NLG/run_math_gslora.py \
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export TOKENIZERS_PARALLELISM=false
+
+exec /root/anaconda3/envs/gslora/bin/deepspeed --num_gpus 4 \
+  examples/NLG/run_math_gslora.py \
   --model_name_or_path /workspace/Models/Llama-3.1-8B-Base \
-  --output_dir "$OUTPUT_DIR" \
+  --output_dir "$EXP/output" \
   --train_dataset_name /workspace/MyTransformers/data/metamathqa_lorapro/metamathqa_lorapro_gsm_tok512_train100k.input_output.jsonl \
   --train_question_column input \
   --train_answer_column output \
@@ -40,8 +41,8 @@ exec python -u examples/NLG/run_math_gslora.py \
   --init_auto_target_ratio 0.08 \
   --init_energy_beta 0.5 \
   --init_small_b_scale 1e-4 \
-  --scaling_mode rank \
-  --calibration_steps 8 \
+  --scaling_mode sqrt_rank \
+  --calibration_steps 128 \
   --max_length 1024 \
   --max_src_len 1024 \
   --max_new_tokens 1024 \
@@ -49,7 +50,7 @@ exec python -u examples/NLG/run_math_gslora.py \
   --num_train_epochs 1 \
   --per_device_train_batch_size 1 \
   --per_device_eval_batch_size 1 \
-  --gradient_accumulation_steps 64 \
+  --gradient_accumulation_steps 16 \
   --learning_rate 5e-5 \
   --weight_decay 5e-4 \
   --warmup_ratio 0.03 \
@@ -59,6 +60,7 @@ exec python -u examples/NLG/run_math_gslora.py \
   --trust_remote_code \
   --wandb \
   --wandb_project GSLoRA-MetaMathQA \
-  --wandb_name "gslora-llama31-metamathqa-paper-aligned-gpu2-seed${SEED}" \
+  --wandb_name "$WANDB_NAME" \
   --wandb_mode online \
-  --wandb_dir "$ROOT/wandb"
+  --wandb_dir "$ROOT/wandb" \
+  2>&1 | tee "$LOG"

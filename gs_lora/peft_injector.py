@@ -125,8 +125,11 @@ def inject_gslora(model, config, target_names, rank_pattern=None, init_state=Non
     for param in model.parameters():
         param.requires_grad = False
 
+    is_encoder_decoder = bool(getattr(getattr(model, "config", None), "is_encoder_decoder", False))
+    task_type = TaskType.SEQ_2_SEQ_LM if is_encoder_decoder else TaskType.CAUSAL_LM
+
     peft_config = LoraConfig(
-        task_type=TaskType.SEQ_2_SEQ_LM,
+        task_type=task_type,
         r=config.base_rank,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,

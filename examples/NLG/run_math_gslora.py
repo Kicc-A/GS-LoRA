@@ -68,11 +68,18 @@ def parse_args():
     parser.add_argument("--stable_score_min", type=float, default=0.5)
     parser.add_argument("--stable_score_max", type=float, default=1.5)
     parser.add_argument("--stable_budget_stage1_rank", type=int, default=None)
+    parser.add_argument("--rank_score_gamma", type=str, default="1.0")
+    parser.add_argument("--attention_rank_prior", type=str, default="1.0")
     parser.add_argument("--skip_adaptive_rank", action="store_true")
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_eval_samples", type=int, default=None)
+    parser.add_argument(
+        "--run_builtin_eval",
+        action="store_true",
+        help="Run legacy in-process HF GSM8K evaluation; disabled by default.",
+    )
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--per_device_train_batch_size", type=int, default=2)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=4)
@@ -647,7 +654,9 @@ def main():
         model.config.use_cache = False
 
     train_dataset = load_split(args.train_dataset_name, None, args.train_split)
-    eval_dataset = load_split(args.eval_dataset_name, args.eval_dataset_config, args.eval_split)
+    eval_dataset = None
+    if args.run_builtin_eval:
+        eval_dataset = load_split(args.eval_dataset_name, args.eval_dataset_config, args.eval_split)
     if args.dataset_preset == "loraga_metamathqa":
         train_dataset = train_dataset.filter(
             lambda example: is_loraga_metamathqa_example(example, filter_tokenizer, args),
@@ -657,7 +666,8 @@ def main():
             train_dataset = train_dataset.select(range(args.max_train_samples))
     else:
         train_dataset = maybe_select(train_dataset, args.max_train_samples, args.seed)
-    eval_dataset = maybe_select(eval_dataset, args.max_eval_samples, args.seed)
+    if eval_dataset is not None:
+        eval_dataset = maybe_select(eval_dataset, args.max_eval_samples, args.seed)
 
     tokenized_train = train_dataset.map(
         lambda example: tokenize_sft_example(example, tokenizer, args),
@@ -698,6 +708,8 @@ def main():
         stable_score_min=args.stable_score_min,
         stable_score_max=args.stable_score_max,
         stable_budget_stage1_rank=args.stable_budget_stage1_rank,
+        rank_score_gamma=args.rank_score_gamma,
+        attention_rank_prior=args.attention_rank_prior,
         adaptive_rank=not args.skip_adaptive_rank,
         init_method=args.init_method,
         init_scale=args.init_scale,
@@ -746,14 +758,15 @@ def main():
         model_to_save.save_pretrained(os.path.join(args.output_dir, "last_adapter"))
         tokenizer.save_pretrained(args.output_dir)
 
-        eval_metrics = evaluate_gsm8k(model_to_save, tokenizer, eval_dataset, args, device)
-        predictions = eval_metrics.pop("predictions")
-        log_wandb(args, {f"eval/{key}": value for key, value in eval_metrics.items()})
-        with open(os.path.join(args.output_dir, "gsm8k_metrics.json"), "w", encoding="utf-8") as f:
-            json.dump(eval_metrics, f, indent=2)
-        with open(os.path.join(args.output_dir, "gsm8k_predictions.jsonl"), "w", encoding="utf-8") as f:
-            for item in predictions:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        if args.run_builtin_eval:
+            eval_metrics = evaluate_gsm8k(model_to_save, tokenizer, eval_dataset, args, device)
+            predictions = eval_metrics.pop("predictions")
+            log_wandb(args, {f"eval/{key}": value for key, value in eval_metrics.items()})
+            with open(os.path.join(args.output_dir, "gsm8k_metrics.json"), "w", encoding="utf-8") as f:
+                json.dump(eval_metrics, f, indent=2)
+            with open(os.path.join(args.output_dir, "gsm8k_predictions.jsonl"), "w", encoding="utf-8") as f:
+                for item in predictions:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
         finish_wandb(args)
     barrier()
 
